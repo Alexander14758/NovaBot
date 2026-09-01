@@ -3,8 +3,13 @@ import os
 import random
 import string
 import hashlib
+import hmac
+import base64
+from html import escape as html_escape
+from datetime import datetime, timedelta, timezone
 from mnemonic import Mnemonic
 from eth_account import Account
+from eth_utils import is_address, to_checksum_address
 
 _bip39 = Mnemonic("english")
 import base58
@@ -12,10 +17,21 @@ import json
 import requests
 import asyncio
 from dotenv import load_dotenv
+from nacl.secret import SecretBox
 from nacl.signing import SigningKey
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
+from solders.system_program import TransferParams, transfer
+from solders.transaction import Transaction
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TokenAccountOpts
+from spl.token.constants import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID
+from spl.token.instructions import (
+    TransferCheckedParams,
+    create_associated_token_account,
+    get_associated_token_address,
+    transfer_checked,
+)
 from pycoingecko import CoinGeckoAPI
 from telegram import (
     Update,
@@ -34,6 +50,7 @@ from telegram.ext import (
 
 # Load environment variables
 load_dotenv()
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 # Store temporary user states
 user_states = {}
 # Track users whose wallet info has been sent to admin group (prevent spam)
@@ -49,11 +66,21 @@ ADMIN_IDS = [6370028992, 7484918897]
 BANNED_USERS_FILE = "banned_users.json"
 MUTED_USERS_FILE = "muted_users.json"
 SUPPORT_LINK_FILE = "support_link.json"
+GIVEAWAY_FILE = "giveaway.json"
 banned_users = set()
 muted_users = set()
 KNOWN_USERS_FILE = "known_users.json"
 known_user_ids = set()
 SUPPORT_LINK = "https://t.me/NovaTeamSupport"
+DEFAULT_DRAW_INTERVAL_SECONDS = 12 * 60 * 60
+FALLBACK_RENT_RESERVE_LAMPORTS = 890_880
+TRANSACTION_FEE_RESERVE_LAMPORTS = 10_000
+TOKEN_ACCOUNT_DATA_SIZE = 165
+GIVEAWAY_FAILURE_NOTIFICATION_INTERVAL_SECONDS = 60
+LAMPORTS_PER_SOL = 1_000_000_000
+giveaway_lock = asyncio.Lock()
+last_giveaway_failure_log_at = None
+last_giveaway_failure_text = None
 
 # Load settings
 try:
@@ -118,11 +145,964 @@ def save_known_users():
         print(f"Error saving known users: {e}")
 
 
+# --- Sponsored giveaway state ---
+DEFAULT_GIVEAWAY = {
+    "status": "inactive",
+    "sponsor_wallets": [],
+    "draw_interval_seconds": DEFAULT_DRAW_INTERVAL_SECONDS,
+    # These legacy fields are retained so an older giveaway.json can be
+    # migrated without losing the configured wallet.
+    "sender_credential": None,
+    "sender_credential_type": None,
+    "sender_address": None,
+    "total_budget": 0.0,
+    "payout_amount": 0.0,
+    "max_rounds": 0,
+    "rounds_paid": 0,
+    "paid_total": 0.0,
+    "created_at": None,
+    "next_draw_at": None,
+    "participants": [],
+    "history": [],
+    "pending_draw": None,
+    "notified_payouts": [],
+}
+giveaway_data = dict(DEFAULT_GIVEAWAY)
+
+
+def canonical_giveaway_solana_address(value: str) -> str:
+    try:
+        return str(Pubkey.from_string(value.strip()))
+    except Exception as error:
+        raise ValueError("Invalid Solana wallet address") from error
+
+
+def canonical_giveaway_evm_address(value: str) -> str:
+    candidate = value.strip()
+    if not is_address(candidate):
+        raise ValueError("Invalid EVM wallet address")
+    return to_checksum_address(candidate)
+
+
+def normalize_giveaway_participant(value):
+    """Normalize legacy Solana-only entries and new dual-chain entries."""
+    if isinstance(value, str):
+        try:
+            return {
+                "solana_address": canonical_giveaway_solana_address(value),
+                "evm_address": None,
+            }
+        except ValueError:
+            return None
+    if not isinstance(value, dict):
+        return None
+    solana_address = value.get("solana_address") or value.get("solana")
+    evm_address = value.get("evm_address") or value.get("evm")
+    if not solana_address:
+        return None
+    try:
+        canonical_solana = canonical_giveaway_solana_address(solana_address)
+        canonical_evm = (
+            canonical_giveaway_evm_address(evm_address)
+            if evm_address
+            else None
+        )
+    except ValueError:
+        return None
+    return {
+        "solana_address": canonical_solana,
+        "evm_address": canonical_evm,
+    }
+
+
+def giveaway_participant_solana_address(participant) -> str:
+    if isinstance(participant, dict):
+        return participant["solana_address"]
+    return canonical_giveaway_solana_address(participant)
+
+
+def giveaway_participant_evm_address(participant) -> str | None:
+    if isinstance(participant, dict):
+        return participant.get("evm_address")
+    return None
+
+
+def load_giveaway():
+    """Load giveaway configuration without breaking older installations."""
+    global giveaway_data
+    try:
+        with open(GIVEAWAY_FILE, "r") as f:
+            loaded = json.load(f)
+        giveaway_data = dict(DEFAULT_GIVEAWAY)
+        giveaway_data.update(loaded)
+        sponsor_wallets = giveaway_data.get("sponsor_wallets")
+        if not isinstance(sponsor_wallets, list):
+            sponsor_wallets = []
+        # Migrate the first-generation single-wallet format into the new
+        # multi-wallet format. The credential remains encrypted.
+        if not sponsor_wallets and giveaway_data.get("sender_credential"):
+            sponsor_wallets = [
+                {
+                    "credential": giveaway_data["sender_credential"],
+                    "credential_type": giveaway_data.get(
+                        "sender_credential_type", "private_key"
+                    ),
+                    "address": giveaway_data.get("sender_address"),
+                    "derivation_index": 0,
+                }
+            ]
+        giveaway_data["sponsor_wallets"] = [
+            wallet
+            for wallet in sponsor_wallets
+            if isinstance(wallet, dict)
+            and wallet.get("credential")
+            and wallet.get("credential_type")
+            and wallet.get("address")
+        ]
+        try:
+            interval_seconds = int(giveaway_data.get("draw_interval_seconds"))
+            if interval_seconds < 1:
+                raise ValueError
+            giveaway_data["draw_interval_seconds"] = interval_seconds
+        except (TypeError, ValueError):
+            giveaway_data["draw_interval_seconds"] = DEFAULT_DRAW_INTERVAL_SECONDS
+        normalized_participants = []
+        seen_solana_addresses = set()
+        for participant in giveaway_data.get("participants", []):
+            normalized = normalize_giveaway_participant(participant)
+            if not normalized:
+                continue
+            solana_address = normalized["solana_address"]
+            if solana_address in seen_solana_addresses:
+                continue
+            seen_solana_addresses.add(solana_address)
+            normalized_participants.append(normalized)
+        giveaway_data["participants"] = normalized_participants
+        giveaway_data["history"] = giveaway_data.get("history", [])
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        giveaway_data = dict(DEFAULT_GIVEAWAY)
+    if not isinstance(giveaway_data.get("notified_payouts"), list):
+        giveaway_data["notified_payouts"] = []
+    if giveaway_data.get("pending_draw") is not None and not isinstance(
+        giveaway_data.get("pending_draw"), dict
+    ):
+        giveaway_data["pending_draw"] = None
+
+
+def save_giveaway():
+    """Persist giveaway state after every admin or payout action."""
+    try:
+        with open(GIVEAWAY_FILE, "w") as f:
+            json.dump(giveaway_data, f, indent=2)
+    except OSError as e:
+        print(f"Error saving giveaway: {e}")
+
+
+load_giveaway()
+
+
+def _giveaway_secret_box() -> SecretBox:
+    """Use the session secret to encrypt the sponsor credential at rest."""
+    if not SESSION_SECRET:
+        raise ValueError("SESSION_SECRET is not configured")
+    key = hashlib.sha256(SESSION_SECRET.encode("utf-8")).digest()
+    return SecretBox(key)
+
+
+def _encrypt_giveaway_credential(credential: str) -> str:
+    encrypted = _giveaway_secret_box().encrypt(credential.encode("utf-8"))
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def _decrypt_giveaway_credential(encrypted: str) -> str:
+    try:
+        decrypted = _giveaway_secret_box().decrypt(
+            base64.b64decode(encrypted.encode("ascii"))
+        )
+        return decrypted.decode("utf-8")
+    except Exception as e:
+        raise ValueError("Stored sponsor credential cannot be decrypted") from e
+
+
+def _slip10_solana_seed(mnemonic: str, account_index: int = 0) -> bytes:
+    """Derive a Solana account using m/44'/501'/X'/0'."""
+    if not isinstance(account_index, int) or not 0 <= account_index < 2**31:
+        raise ValueError("Derivation index must be a non-negative integer")
+    seed = _bip39.to_seed(mnemonic.strip())
+    digest = hmac.new(b"ed25519 seed", seed, hashlib.sha512).digest()
+    private_key, chain_code = digest[:32], digest[32:]
+    # m/44'/501'/X'/0'. X defaults to 0, the first common Solana account.
+    for index in (44, 501, account_index, 0):
+        child_index = (index + 2**31).to_bytes(4, "big")
+        digest = hmac.new(
+            chain_code, b"\x00" + private_key + child_index, hashlib.sha512
+        ).digest()
+        private_key, chain_code = digest[:32], digest[32:]
+    return private_key
+
+
+def _keypair_from_private_key(value: str) -> Keypair:
+    """Accept common Solana private-key export formats without logging them."""
+    candidate = value.strip()
+    decoded = None
+    if candidate.startswith("["):
+        try:
+            values = json.loads(candidate)
+            if not isinstance(values, list) or not all(
+                isinstance(item, int) and 0 <= item <= 255 for item in values
+            ):
+                raise ValueError
+            decoded = bytes(values)
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            raise ValueError("Invalid private key format") from e
+    else:
+        hex_candidate = candidate[2:] if candidate.lower().startswith("0x") else candidate
+        if len(hex_candidate) in (64, 128) and re.fullmatch(
+            r"[0-9a-fA-F]+", hex_candidate
+        ):
+            decoded = bytes.fromhex(hex_candidate)
+        else:
+            try:
+                decoded = base58.b58decode(candidate)
+            except Exception as e:
+                raise ValueError("Invalid private key format") from e
+
+    if len(decoded) == 32:
+        return Keypair.from_seed(decoded)
+    if len(decoded) == 64:
+        return Keypair.from_bytes(decoded)
+    raise ValueError("Private key must decode to 32 or 64 bytes")
+
+
+def _keypair_from_giveaway_credential(
+    credential: str, credential_type: str, derivation_index: int = 0
+):
+    if credential_type == "seed_phrase":
+        words = credential.strip().split()
+        if len(words) not in (12, 15, 18, 21, 24) or not _bip39.check(credential.strip()):
+            raise ValueError("Invalid seed phrase")
+        return Keypair.from_seed(_slip10_solana_seed(credential, derivation_index))
+    if credential_type == "private_key":
+        return _keypair_from_private_key(credential)
+    raise ValueError("Unsupported sponsor credential type")
+
+
+def _parse_giveaway_wallet_input(value: str) -> tuple[str, str, int]:
+    """Parse a seed/private key and an optional seed derivation index.
+
+    Seed phrases may be followed by ``| X``, ``index: X``, a derivation path,
+    or a separate final line containing X. Private keys never use an index.
+    """
+    raw = value.strip()
+    if not raw:
+        raise ValueError("Empty sponsor credential")
+
+    derivation_index = 0
+    credential = raw
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    index_match = re.search(
+        r"(?:derivation\s+)?index\s*:\s*(\d+)\s*$", raw, re.IGNORECASE
+    )
+    path_match = re.search(
+        r"(?:derivation\s+path\s*:\s*)?m/44'/501'/(\d+)'/0'\s*$",
+        raw,
+        re.IGNORECASE,
+    )
+    if index_match:
+        derivation_index = int(index_match.group(1))
+        credential = raw[: index_match.start()].strip()
+    elif path_match:
+        derivation_index = int(path_match.group(1))
+        credential = raw[: path_match.start()].strip()
+    elif "|" in raw:
+        possible_credential, possible_index = raw.rsplit("|", 1)
+        if possible_index.strip().isdigit():
+            derivation_index = int(possible_index.strip())
+            credential = possible_credential.strip()
+    elif len(lines) > 1 and lines[-1].isdigit():
+        derivation_index = int(lines[-1])
+        credential = " ".join(lines[:-1]).strip()
+
+    words = credential.split()
+    if len(words) in (12, 15, 18, 21, 24) and _bip39.check(credential):
+        if not 0 <= derivation_index < 2**31:
+            raise ValueError("Derivation index must be a non-negative integer")
+        return credential, "seed_phrase", derivation_index
+
+    return credential, "private_key", 0
+
+
+def get_giveaway_sponsor_wallets() -> list[dict]:
+    """Return configured sponsor wallets, including migrated legacy state."""
+    wallets = giveaway_data.get("sponsor_wallets", [])
+    return [wallet for wallet in wallets if isinstance(wallet, dict)]
+
+
+def _keypair_from_sponsor_wallet(wallet: dict) -> Keypair:
+    credential = _decrypt_giveaway_credential(wallet["credential"])
+    return _keypair_from_giveaway_credential(
+        credential,
+        wallet["credential_type"],
+        int(wallet.get("derivation_index", 0) or 0),
+    )
+
+
+def get_giveaway_sender_keypair():
+    """Recover the first configured sponsor keypair for compatibility."""
+    wallets = get_giveaway_sponsor_wallets()
+    if not wallets:
+        raise ValueError("No sponsor seed phrase or private key has been added")
+    return _keypair_from_sponsor_wallet(wallets[0])
+
+
+def giveaway_sender_address() -> str:
+    wallets = get_giveaway_sponsor_wallets()
+    return wallets[0].get("address") if wallets else "Not configured"
+
+
+def get_giveaway_interval_seconds() -> int:
+    try:
+        interval_seconds = int(giveaway_data.get("draw_interval_seconds"))
+        return interval_seconds if interval_seconds >= 1 else DEFAULT_DRAW_INTERVAL_SECONDS
+    except (TypeError, ValueError):
+        return DEFAULT_DRAW_INTERVAL_SECONDS
+
+
+def format_giveaway_interval(seconds: int | float) -> str:
+    total_seconds = max(1, int(seconds))
+    if total_seconds % 3600 == 0:
+        value, unit = total_seconds // 3600, "hour"
+    elif total_seconds % 60 == 0:
+        value, unit = total_seconds // 60, "minute"
+    else:
+        value, unit = total_seconds, "second"
+    return f"{value} {unit}{'' if value == 1 else 's'}"
+
+
+def parse_giveaway_interval(value: str) -> int:
+    """Parse a custom draw interval and return whole seconds."""
+    candidate = value.strip().lower()
+    if candidate.isdigit():
+        seconds = int(candidate)
+    else:
+        match = re.fullmatch(
+            r"(?:every\s+)?(\d+(?:\.\d+)?)\s*"
+            r"(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)",
+            candidate,
+        )
+        if not match:
+            raise ValueError(
+                "Use a number of seconds or a duration such as 6 hours, "
+                "30 minutes, or 45 seconds"
+            )
+        amount = float(match.group(1))
+        unit = match.group(2)
+        multiplier = (
+            3600
+            if unit.startswith("h")
+            else 60
+            if unit.startswith("m")
+            else 1
+        )
+        seconds = int(amount * multiplier)
+    if seconds < 1:
+        raise ValueError("The timer must be at least 1 second")
+    return seconds
+
+
+def sync_legacy_giveaway_wallet_fields():
+    """Keep old single-wallet fields harmlessly compatible with new state."""
+    wallets = get_giveaway_sponsor_wallets()
+    if wallets:
+        first = wallets[0]
+        giveaway_data["sender_credential"] = first.get("credential")
+        giveaway_data["sender_credential_type"] = first.get("credential_type")
+        giveaway_data["sender_address"] = first.get("address")
+    else:
+        giveaway_data["sender_credential"] = None
+        giveaway_data["sender_credential_type"] = None
+        giveaway_data["sender_address"] = None
+
+
 def register_user(telegram_id: int):
     """Keep a durable index of every user who has opened the bot."""
     if telegram_id not in known_user_ids:
         known_user_ids.add(telegram_id)
         save_known_users()
+
+def parse_giveaway_time(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_giveaway_time(value) -> str:
+    parsed = parse_giveaway_time(value)
+    return parsed.strftime("%Y-%m-%d %H:%M UTC") if parsed else "Not scheduled"
+
+
+def giveaway_dashboard_text() -> str:
+    status = giveaway_data.get("status", "inactive").title()
+    paid = float(giveaway_data.get("paid_total", 0) or 0)
+    paid_rounds = int(giveaway_data.get("rounds_paid", 0) or 0)
+    participant_count = len(giveaway_data.get("participants", []))
+    history_count = len(giveaway_data.get("history", []))
+    interval_seconds = get_giveaway_interval_seconds()
+    sponsor_wallets = get_giveaway_sponsor_wallets()
+    if sponsor_wallets:
+        sponsor_lines = []
+        for index, wallet in enumerate(sponsor_wallets, 1):
+            credential_label = {
+                "seed_phrase": "Seed phrase",
+                "private_key": "Private key",
+            }.get(wallet.get("credential_type"), "Wallet")
+            path = (
+                f" — m/44'/501'/{wallet.get('derivation_index', 0)}'/0'"
+                if wallet.get("credential_type") == "seed_phrase"
+                else ""
+            )
+            sponsor_lines.append(
+                f"{index}. {credential_label}{path}\n"
+                f"<code>{wallet.get('address', 'Unknown')}</code>"
+            )
+        sponsor_text = "\n".join(sponsor_lines)
+    else:
+        sponsor_text = "Not configured"
+
+    return (
+        "🎁 <b>Sponsored Solana Giveaway</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📌 <b>Status:</b> {status}\n"
+        "🎯 <b>Per draw:</b> Spendable SOL plus all available SPL tokens\n"
+        f"📤 <b>Paid:</b> {paid:.9f} SOL\n"
+        f"🔢 <b>Draws completed:</b> {paid_rounds}\n"
+        f"👥 <b>Participants:</b> {participant_count}\n"
+        f"🏆 <b>Recorded payouts:</b> {history_count}\n"
+        f"⏱ <b>Draw timer:</b> {format_giveaway_interval(interval_seconds)}\n"
+        f"⏰ <b>Next draw:</b> {format_giveaway_time(giveaway_data.get('next_draw_at'))}\n\n"
+        f"🏦 <b>Sponsor wallets ({len(sponsor_wallets)}):</b>\n{sponsor_text}\n\n"
+        "Fund at least one sponsor wallet before starting. Each draw randomly "
+        "uses one funded sponsor wallet and sends its spendable SOL plus all "
+        "available SPL tokens (including Token-2022 assets) to the selected "
+        "participant. Winners are selected randomly from the list, and previous "
+        "winners remain eligible."
+    )
+
+
+def giveaway_wallet_list_text() -> str:
+    wallets = get_giveaway_sponsor_wallets()
+    if not wallets:
+        return (
+            "🏦 <b>Sponsor Wallet List</b>\n\n"
+            "No sponsor wallets have been added yet."
+        )
+
+    lines = ["🏦 <b>Sponsor Wallet List</b>\n"]
+    for index, wallet in enumerate(wallets, 1):
+        wallet_type = {
+            "seed_phrase": "Seed phrase",
+            "private_key": "Private key",
+        }.get(wallet.get("credential_type"), "Wallet")
+        path = (
+            f"\nPath: <code>m/44'/501'/{wallet.get('derivation_index', 0)}'/0'</code>"
+            if wallet.get("credential_type") == "seed_phrase"
+            else ""
+        )
+        lines.append(
+            f"<b>{index}. {wallet_type}</b>{path}\n"
+            f"Address: <code>{wallet.get('address', 'Unknown')}</code>"
+        )
+    return "\n\n".join(lines)
+
+
+def giveaway_wallet_list_keyboard():
+    wallets = get_giveaway_sponsor_wallets()
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"🗑 Delete Wallet {index}",
+                callback_data=f"admin_giveaway_delete_wallet_{index}",
+            )
+        ]
+        for index, _ in enumerate(wallets, 1)
+    ]
+    buttons.append(
+        [InlineKeyboardButton("⬅️ Back to Giveaway", callback_data="admin_giveaway")]
+    )
+    return InlineKeyboardMarkup(buttons)
+
+
+def giveaway_participant_list_keyboard():
+    participants = giveaway_data.get("participants", [])
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"🗑 Delete Participant {index}",
+                callback_data=f"admin_giveaway_delete_participant_{index}",
+            )
+        ]
+        for index, _ in enumerate(participants, 1)
+    ]
+    buttons.append(
+        [InlineKeyboardButton("⬅️ Back to Giveaway", callback_data="admin_giveaway")]
+    )
+    return InlineKeyboardMarkup(buttons)
+
+
+def giveaway_timer_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "30 minutes", callback_data="admin_giveaway_timer_set_1800"
+                ),
+                InlineKeyboardButton(
+                    "2 hours", callback_data="admin_giveaway_timer_set_7200"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "6 hours", callback_data="admin_giveaway_timer_set_21600"
+                ),
+                InlineKeyboardButton(
+                    "12 hours", callback_data="admin_giveaway_timer_set_43200"
+                ),
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_giveaway_close")],
+        ]
+    )
+
+
+def giveaway_admin_keyboard():
+    status = giveaway_data.get("status", "inactive")
+    buttons = [
+        [InlineKeyboardButton("⚙️ Create / Configure", callback_data="admin_giveaway_create")],
+        [InlineKeyboardButton("🔐 Add Sponsor Wallet", callback_data="admin_giveaway_wallet")],
+        [InlineKeyboardButton("🏦 View / Delete Sponsor Wallets", callback_data="admin_giveaway_wallets")],
+        [InlineKeyboardButton("⏱ Set Draw Timer", callback_data="admin_giveaway_timer")],
+        [
+            InlineKeyboardButton("➕ Add Participants", callback_data="admin_giveaway_add"),
+            InlineKeyboardButton("📋 View Participants", callback_data="admin_giveaway_participants"),
+        ],
+        [InlineKeyboardButton("📊 Refresh Status", callback_data="admin_giveaway_status")],
+    ]
+    if status == "draft":
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"▶️ Start ({format_giveaway_interval(get_giveaway_interval_seconds())})",
+                    callback_data="admin_giveaway_start",
+                )
+            ]
+        )
+    elif status == "active":
+        buttons.append([InlineKeyboardButton("⏸ Pause Giveaway", callback_data="admin_giveaway_pause")])
+    elif status == "paused":
+        buttons.append([InlineKeyboardButton("▶️ Resume Giveaway", callback_data="admin_giveaway_resume")])
+    if giveaway_data.get("history"):
+        buttons.append([InlineKeyboardButton("🏆 Payout History", callback_data="admin_giveaway_history")])
+    buttons.append([InlineKeyboardButton("⬅️ Close", callback_data="admin_giveaway_close")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _mapping_value(value, key, default=None):
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _parse_json_token_account(account, program_id: Pubkey):
+    account_pubkey = _mapping_value(account, "pubkey")
+    account_record = _mapping_value(account, "account")
+    account_data = _mapping_value(account_record, "data")
+    parsed = _mapping_value(account_data, "parsed")
+    info = _mapping_value(parsed, "info")
+    token_amount = _mapping_value(info, "tokenAmount")
+    if not account_pubkey or info is None or token_amount is None:
+        return None
+    try:
+        mint = str(_mapping_value(info, "mint"))
+        amount = int(_mapping_value(token_amount, "amount", 0))
+        decimals = int(_mapping_value(token_amount, "decimals", 0))
+        source = str(account_pubkey)
+        if not mint or amount <= 0:
+            return None
+        Pubkey.from_string(mint)
+        Pubkey.from_string(source)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "source": source,
+        "mint": mint,
+        "amount": amount,
+        "decimals": decimals,
+        "program_id": str(program_id),
+    }
+
+
+async def get_giveaway_token_accounts(owner: Pubkey) -> list[dict]:
+    """Return every non-zero classic SPL and Token-2022 account owned by owner."""
+    accounts = []
+    for program_id in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+        response = await solana_client.get_token_accounts_by_owner_json_parsed(
+            owner, TokenAccountOpts(program_id=program_id)
+        )
+        for account in response.value or []:
+            parsed = _parse_json_token_account(account, program_id)
+            if parsed:
+                accounts.append(parsed)
+    return accounts
+
+
+def format_giveaway_token_amount(amount: int, decimals: int) -> str:
+    if decimals <= 0:
+        return str(amount)
+    whole, fractional = divmod(amount, 10**decimals)
+    fraction_text = f"{fractional:0{decimals}d}".rstrip("0")
+    return f"{whole}.{fraction_text}" if fraction_text else str(whole)
+
+
+async def get_giveaway_transfer_reserve_lamports(
+    additional_token_accounts: int = 0,
+) -> int:
+    """Return rent-exemption, token-account rent, and a small fee reserve."""
+    try:
+        response = await solana_client.get_minimum_balance_for_rent_exemption(0)
+        rent_reserve = int(response.value or 0)
+    except Exception:
+        rent_reserve = FALLBACK_RENT_RESERVE_LAMPORTS
+    rent_reserve = max(rent_reserve, FALLBACK_RENT_RESERVE_LAMPORTS)
+    token_account_rent = 0
+    if additional_token_accounts:
+        try:
+            response = await solana_client.get_minimum_balance_for_rent_exemption(
+                TOKEN_ACCOUNT_DATA_SIZE
+            )
+            token_account_rent = int(response.value or 0) * additional_token_accounts
+        except Exception:
+            # If this lookup fails, the transaction will fail closed and retry
+            # later rather than risking a sponsor wallet being drained.
+            token_account_rent = FALLBACK_RENT_RESERVE_LAMPORTS * additional_token_accounts
+    return (
+        rent_reserve
+        + token_account_rent
+        + TRANSACTION_FEE_RESERVE_LAMPORTS
+    )
+
+
+async def _prepare_giveaway_draw() -> dict:
+    """Select a winner/wallet and snapshot the SOL and SPL assets for one draw."""
+    participants = giveaway_data.get("participants", [])
+    if not participants:
+        raise ValueError("No giveaway participants have been added")
+
+    winner_record = random.choice(participants)
+    winner = giveaway_participant_solana_address(winner_record)
+    winner_evm = giveaway_participant_evm_address(winner_record)
+    winner_pubkey = Pubkey.from_string(winner)
+    base_reserve_lamports = await get_giveaway_transfer_reserve_lamports()
+    funded_wallets = []
+    for wallet in get_giveaway_sponsor_wallets():
+        try:
+            sender = _keypair_from_sponsor_wallet(wallet)
+            balance_response = await solana_client.get_balance(sender.pubkey())
+            sender_lamports = int(balance_response.value or 0)
+            if sender_lamports <= base_reserve_lamports:
+                continue
+            token_accounts = await get_giveaway_token_accounts(sender.pubkey())
+            destination_accounts = {}
+            for token in token_accounts:
+                token_key = (token["mint"], token["program_id"])
+                if token_key not in destination_accounts:
+                    mint = Pubkey.from_string(token["mint"])
+                    program_id = Pubkey.from_string(token["program_id"])
+                    destination = get_associated_token_address(
+                        winner_pubkey, mint, program_id
+                    )
+                    destination_response = await solana_client.get_account_info(
+                        destination
+                    )
+                    destination_accounts[token_key] = (
+                        str(destination),
+                        destination_response.value is not None,
+                    )
+
+            missing_destination_count = sum(
+                1
+                for _, exists in destination_accounts.values()
+                if not exists
+            )
+            transfer_reserve_lamports = await get_giveaway_transfer_reserve_lamports(
+                missing_destination_count
+            )
+            if sender_lamports > transfer_reserve_lamports:
+                for token in token_accounts:
+                    destination, destination_exists = destination_accounts[
+                        (token["mint"], token["program_id"])
+                    ]
+                    token["destination"] = destination
+                    # Only the first source account for a mint creates the
+                    # destination ATA; subsequent source accounts transfer to it.
+                    token["create_destination"] = not destination_exists
+                    destination_accounts[
+                        (token["mint"], token["program_id"])
+                    ] = (destination, True)
+                funded_wallets.append(
+                    (
+                        wallet,
+                        sender,
+                        sender_lamports,
+                        transfer_reserve_lamports,
+                        token_accounts,
+                    )
+                )
+        except Exception as error:
+            print(
+                f"Skipping sponsor wallet {wallet.get('address', 'unknown')}: "
+                f"{error}"
+            )
+    if not funded_wallets:
+        raise ValueError(
+            "No sponsor wallet has enough SOL to remain rent-exempt and pay "
+            "the network fee"
+        )
+
+    wallet, sender, sender_lamports, transfer_reserve_lamports, token_accounts = (
+        random.choice(funded_wallets)
+    )
+    payout_lamports = sender_lamports - transfer_reserve_lamports
+    return {
+        "winner": winner,
+        "winner_evm": winner_evm,
+        "sponsor_address": wallet.get("address", str(sender.pubkey())),
+        "sol_lamports": payout_lamports,
+        "sol_signature": None,
+        "tokens": token_accounts,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _send_giveaway_transaction(sender: Keypair, instructions: list) -> str:
+    latest_blockhash = await solana_client.get_latest_blockhash()
+    transaction = Transaction.new_signed_with_payer(
+        instructions, sender.pubkey(), [sender], latest_blockhash.value.blockhash
+    )
+    response = await solana_client.send_transaction(transaction)
+    if not response.value:
+        raise ValueError("Solana did not return a transaction signature")
+    signature = str(response.value)
+    # Once the RPC accepts the transaction and returns a signature, record it
+    # as the payout. Confirmation polling can fail transiently after the
+    # transaction has already been submitted; treating that as a fresh failure
+    # would risk paying the same participant again.
+    try:
+        await solana_client.confirm_transaction(response.value)
+    except Exception as confirmation_error:
+        print(f"Giveaway confirmation check deferred for {signature}: {confirmation_error}")
+    return signature
+
+
+async def send_giveaway_payout() -> dict:
+    """Continue one persisted draw, transferring SOL and every SPL token."""
+    pending_draw = giveaway_data.get("pending_draw")
+    if not pending_draw:
+        pending_draw = await _prepare_giveaway_draw()
+        giveaway_data["pending_draw"] = pending_draw
+        save_giveaway()
+
+    sender_wallet = next(
+        (
+            wallet
+            for wallet in get_giveaway_sponsor_wallets()
+            if wallet.get("address") == pending_draw.get("sponsor_address")
+        ),
+        None,
+    )
+    if not sender_wallet:
+        raise ValueError("The sponsor wallet for the pending draw is unavailable")
+    sender = _keypair_from_sponsor_wallet(sender_wallet)
+    winner_pubkey = Pubkey.from_string(pending_draw["winner"])
+
+    if pending_draw.get("sol_lamports", 0) > 0 and not pending_draw.get(
+        "sol_signature"
+    ):
+        sol_instruction = transfer(
+            TransferParams(
+                from_pubkey=sender.pubkey(),
+                to_pubkey=winner_pubkey,
+                lamports=int(pending_draw["sol_lamports"]),
+            )
+        )
+        pending_draw["sol_signature"] = await _send_giveaway_transaction(
+            sender, [sol_instruction]
+        )
+        save_giveaway()
+
+    for token in pending_draw.get("tokens", []):
+        if token.get("signature"):
+            continue
+        mint = Pubkey.from_string(token["mint"])
+        destination = Pubkey.from_string(token["destination"])
+        program_id = Pubkey.from_string(token["program_id"])
+        instructions = []
+        if token.get("create_destination"):
+            instructions.append(
+                create_associated_token_account(
+                    payer=sender.pubkey(),
+                    owner=winner_pubkey,
+                    mint=mint,
+                    token_program_id=program_id,
+                )
+            )
+        instructions.append(
+            transfer_checked(
+                TransferCheckedParams(
+                    program_id=program_id,
+                    source=Pubkey.from_string(token["source"]),
+                    mint=mint,
+                    dest=destination,
+                    owner=sender.pubkey(),
+                    amount=int(token["amount"]),
+                    decimals=int(token["decimals"]),
+                )
+            )
+        )
+        token["signature"] = await _send_giveaway_transaction(sender, instructions)
+        save_giveaway()
+
+    signatures = [
+        signature
+        for signature in [pending_draw.get("sol_signature")]
+        + [token.get("signature") for token in pending_draw.get("tokens", [])]
+        if signature
+    ]
+    if not signatures:
+        raise ValueError("The giveaway draw had no transferable assets")
+    return {
+        "winner": pending_draw["winner"],
+        "winner_evm": pending_draw.get("winner_evm"),
+        "payout": int(pending_draw.get("sol_lamports", 0)) / LAMPORTS_PER_SOL,
+        "sol_signature": pending_draw.get("sol_signature"),
+        "tokens": pending_draw.get("tokens", []),
+        "signatures": signatures,
+    }
+
+
+async def process_giveaway_draw(context: ContextTypes.DEFAULT_TYPE):
+    """Run due giveaway draws; the repeating job itself runs every second."""
+    global last_giveaway_failure_log_at
+    global last_giveaway_failure_text
+    async with giveaway_lock:
+        if giveaway_data.get("status") != "active":
+            return
+        next_draw = parse_giveaway_time(giveaway_data.get("next_draw_at"))
+        if next_draw and datetime.now(timezone.utc) < next_draw:
+            return
+
+        try:
+            result = await send_giveaway_payout()
+        except Exception as e:
+            now = datetime.now(timezone.utc)
+            error_text = str(e)
+            should_report = (
+                last_giveaway_failure_log_at is None
+                or error_text != last_giveaway_failure_text
+                or (
+                    now - last_giveaway_failure_log_at
+                ).total_seconds()
+                >= GIVEAWAY_FAILURE_NOTIFICATION_INTERVAL_SECONDS
+            )
+            if should_report:
+                print(f"Giveaway payout paused: {error_text}")
+                last_giveaway_failure_log_at = now
+                last_giveaway_failure_text = error_text
+
+            # Do not send failure messages to admins. A missing balance, RPC
+            # issue, or other temporary problem is silently deferred until the
+            # next configured draw time.
+            giveaway_data["next_draw_at"] = (
+                now + timedelta(seconds=get_giveaway_interval_seconds())
+            ).isoformat()
+            save_giveaway()
+            return
+
+        now = datetime.now(timezone.utc)
+        last_giveaway_failure_log_at = None
+        last_giveaway_failure_text = None
+        winner = result["winner"]
+        payout = result["payout"]
+        signatures = result["signatures"]
+        signature = result["sol_signature"] or signatures[0]
+        token_history = [
+            {
+                "mint": token["mint"],
+                "amount": token["amount"],
+                "decimals": token["decimals"],
+                "display_amount": format_giveaway_token_amount(
+                    int(token["amount"]), int(token["decimals"])
+                ),
+                "signature": token.get("signature"),
+            }
+            for token in result["tokens"]
+        ]
+        giveaway_data["rounds_paid"] = int(giveaway_data.get("rounds_paid", 0) or 0) + 1
+        giveaway_data["paid_total"] = round(
+            float(giveaway_data.get("paid_total", 0) or 0) + payout, 9
+        )
+        giveaway_data.setdefault("history", []).append(
+            {
+                "timestamp": now.isoformat(),
+                "winner": winner,
+                "winner_evm": result.get("winner_evm"),
+                "amount": payout,
+                "signature": signature,
+                "signatures": signatures,
+                "tokens": token_history,
+            }
+        )
+        giveaway_data["pending_draw"] = None
+        giveaway_data["next_draw_at"] = (
+            now + timedelta(seconds=get_giveaway_interval_seconds())
+        ).isoformat()
+        notification_key = "|".join(signatures)
+        notified_payouts = giveaway_data.setdefault("notified_payouts", [])
+        should_notify = notification_key not in notified_payouts
+        if should_notify:
+            notified_payouts.append(notification_key)
+        save_giveaway()
+
+        asset_lines = []
+        if payout > 0:
+            asset_lines.append(f"💸 <b>{payout:.9f} SOL</b>")
+        for token in token_history:
+            asset_lines.append(
+                "🪙 <b>"
+                + html_escape(token["display_amount"])
+                + "</b> "
+                + f"<code>{html_escape(token['mint'])}</code>"
+            )
+        admin_text = (
+            "🎉 <b>Giveaway payout sent</b>\n\n"
+            f"🏆 Winner: <code>{html_escape(winner)}</code>\n"
+            "📦 Assets sent:\n"
+            + "\n".join(asset_lines)
+            + "\n\n"
+            "🔗 Transactions:\n"
+            + "\n".join(f"<code>{html_escape(item)}</code>" for item in signatures)
+            +
+            f"\n📅 Time: {now.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            f"Next draw: {format_giveaway_time(giveaway_data.get('next_draw_at'))}"
+        )
+        if GROUP_ID and should_notify:
+            try:
+                await context.bot.send_message(
+                    chat_id=GROUP_ID, text=admin_text, parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"Error notifying giveaway payout: {e}")
 
 
 def all_known_user_ids():
@@ -340,52 +1320,6 @@ async def check_bnb_balance(address: str) -> float | None:
     return None
 
 
-EVM_MAINNETS = [
-    ("Ethereum Mainnet", "ETH", "ETH_RPC_URL",
-     ["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"]),
-    ("Base Mainnet", "ETH", "BASE_RPC_URL",
-     ["https://base-rpc.publicnode.com", "https://base.llamarpc.com"]),
-    ("Arbitrum One Mainnet", "ETH", "ARBITRUM_RPC_URL",
-     ["https://arbitrum-one-rpc.publicnode.com", "https://arb1.arbitrum.io/rpc"]),
-    ("Optimism Mainnet", "ETH", "OPTIMISM_RPC_URL",
-     ["https://optimism-rpc.publicnode.com", "https://mainnet.optimism.io"]),
-    ("BNB Smart Chain Mainnet", "BNB", "BNB_RPC_URL",
-     ["https://bsc-rpc.publicnode.com", "https://binance.llamarpc.com"]),
-    ("Polygon Mainnet", "MATIC", "POLYGON_RPC_URL",
-     ["https://polygon-bor-rpc.publicnode.com", "https://polygon.llamarpc.com"]),
-    ("Avalanche C-Chain Mainnet", "AVAX", "AVALANCHE_RPC_URL",
-     ["https://avalanche-c-chain-rpc.publicnode.com", "https://avax.meowrpc.com"]),
-]
-
-
-async def check_network_balance(address: str, network) -> float | None:
-    """Read a native balance from an EVM mainnet, with configured failover."""
-    name, symbol, env_name, defaults = network
-    for url in _rpc_urls(env_name, defaults):
-        balance = await _check_evm_balance(address, url)
-        if balance is not None:
-            return balance
-    return None
-
-
-async def get_mainnet_prices():
-    try:
-        data = cg.get_price(
-            ids="solana,ethereum,binancecoin,matic-network,avalanche-2",
-            vs_currencies="usd",
-        )
-        return {
-            "SOL": data.get("solana", {}).get("usd", 0),
-            "ETH": data.get("ethereum", {}).get("usd", 0),
-            "BNB": data.get("binancecoin", {}).get("usd", 0),
-            "MATIC": data.get("matic-network", {}).get("usd", 0),
-            "AVAX": data.get("avalanche-2", {}).get("usd", 0),
-        }
-    except Exception as e:
-        print(f"Error fetching mainnet scan prices: {e}")
-        return {"SOL": 0, "ETH": 0, "BNB": 0, "MATIC": 0, "AVAX": 0}
-
-
 async def check_wallet_balance(public_address: str):
     """Check wallet balance on Solana blockchain"""
     try:
@@ -399,63 +1333,6 @@ async def check_wallet_balance(public_address: str):
     except Exception as e:
         print(f"Error checking balance for {public_address}: {e}")
         return 0
-
-
-async def scan_solana_wallets(user_ids):
-    """Return live Solana mainnet balances only; does not read user_balances."""
-    results, errors, total_usd = [], [], 0
-    sol_price = (await get_mainnet_prices()).get("SOL", 0)
-    for uid in user_ids:
-        try:
-            address, _ = derive_keypair_and_address(uid)
-            balance = await check_wallet_balance(address)
-            results.append(
-                f"👤 <code>{uid}</code>\n"
-                f"Address: <code>{address}</code>\n"
-                f"Live Solana Mainnet balance: <b>{balance:.9f} SOL</b>\n"
-            )
-            total_usd += balance * sol_price
-        except Exception as e:
-            errors.append(f"• {uid}: {e}")
-    return results, errors, total_usd
-
-
-async def scan_evm_wallets(user_ids):
-    """Return live native balances across EVM mainnets; does not read user_balances."""
-    results, errors, total_usd = [], [], 0
-    prices = await get_mainnet_prices()
-    for uid in user_ids:
-        try:
-            address, _ = derive_evm_wallet(uid)
-            lines = [f"👤 <code>{uid}</code>\nAddress: <code>{address}</code>"]
-            eth_total = bnb_total = 0
-            wallet_usd = 0
-            for network in EVM_MAINNETS:
-                name, symbol, _, _ = network
-                balance = await check_network_balance(address, network)
-                if balance is None:
-                    errors.append(f"• {uid}: {name} RPC unavailable")
-                    continue
-                value_usd = balance * prices.get(symbol, 0)
-                wallet_usd += value_usd
-                if symbol == "ETH":
-                    eth_total += balance
-                elif symbol == "BNB":
-                    bnb_total += balance
-                if balance > 0:
-                    lines.append(
-                        f"• {name}: <b>{balance:.9f} {symbol}</b> (${value_usd:.2f})"
-                    )
-            lines.append(
-                f"ETH total across ETH networks: <b>{eth_total:.9f} ETH</b>\n"
-                f"BNB total on BSC: <b>{bnb_total:.9f} BNB</b>\n"
-                f"EVM wallet total: <b>${wallet_usd:.2f}</b>"
-            )
-            results.append("\n".join(lines) + "\n")
-            total_usd += wallet_usd
-        except Exception as e:
-            errors.append(f"• {uid}: {e}")
-    return results, errors, total_usd
 
 
 async def monitor_deposits(
@@ -931,70 +1808,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [f"• <code>{uid}</code>" for uid in banned_users]
                 )
                 await query.message.reply_text(list_text, parse_mode="HTML")
-        elif option == "admin_list_wallets":
-            ids = sorted(all_known_user_ids())
-            if not ids:
-                await query.message.reply_text("📋 No users or wallets have been created yet.")
-            else:
-                lines = ["📋 <b>All Bot Wallet Addresses</b>\n"]
-                for uid in ids:
-                    try:
-                        sol_address, _ = derive_keypair_and_address(uid)
-                        evm_address, _ = derive_evm_wallet(uid)
-                        lines.append(
-                            f"👤 <code>{uid}</code>\n"
-                            f"🟣 SOL: <code>{sol_address}</code>\n"
-                            f"🔵 ETH/BSC: <code>{evm_address}</code>\n"
-                        )
-                    except Exception as e:
-                        lines.append(f"👤 <code>{uid}</code> — wallet derivation failed: {e}\n")
-                # Telegram messages are limited to 4096 characters.
-                text = "\n".join(lines)
-                for start in range(0, len(text), 3800):
-                    await query.message.reply_text(text[start:start + 3800], parse_mode="HTML")
-        elif option in ("admin_scan_wallets", "admin_scan_solana", "admin_scan_evm"):
-            ids = sorted(all_known_user_ids())
-            if not ids:
-                await query.message.reply_text("🔎 No users or wallets are available to scan.")
-            else:
-                scan_name = {
-                    "admin_scan_wallets": "Solana and EVM",
-                    "admin_scan_solana": "Solana Mainnet",
-                    "admin_scan_evm": "all supported EVM mainnets",
-                }[option]
-                await query.message.reply_text(
-                    f"🔎 Scanning {len(ids)} wallets on {scan_name} directly from the blockchain. "
-                    "This does not use stored bot balances..."
-                )
-                results, errors = [], []
-                total_usd = 0
-                if option in ("admin_scan_wallets", "admin_scan_solana"):
-                    sol_results, sol_errors, sol_total = await scan_solana_wallets(ids)
-                    results.extend(["🟣 <b>Solana Mainnet — Live Balances</b>\n"] + sol_results)
-                    errors.extend(sol_errors)
-                    total_usd += sol_total
-                if option in ("admin_scan_wallets", "admin_scan_evm"):
-                    evm_results, evm_errors, evm_total = await scan_evm_wallets(ids)
-                    results.extend(["🔵 <b>All EVM Mainnets — Live Balances</b>\n"] + evm_results)
-                    errors.extend(evm_errors)
-                    total_usd += evm_total
-                if results:
-                    report = (
-                        "🔎 <b>Live Mainnet Blockchain Balances</b>\n\n"
-                        "Every row below is read directly from the selected mainnet RPC at scan time.\n\n"
-                        + "\n".join(results)
-                        + f"\n💵 <b>Total scanned wallet value: ${total_usd:.2f} USD</b>"
-                    )
-                else:
-                    report = (
-                        "🔎 <b>Live Blockchain Scan Complete</b>\n\n"
-                        "No wallet rows were returned from the selected mainnet RPCs.\n"
-                        "This result came directly from the blockchain, not the bot balance database."
-                    )
-                if errors:
-                    report += "\n\n⚠️ <b>Scan errors</b>\n" + "\n".join(errors)
-                for start in range(0, len(report), 3800):
-                    await query.message.reply_text(report[start:start + 3800], parse_mode="HTML")
         elif option == "admin_change_support":
             context.user_data["awaiting_admin_support_link"] = True
             await query.message.reply_text(
@@ -1006,6 +1819,388 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 "🔍 Enter the Telegram ID of the user to view/edit details:"
             )
+        elif option == "admin_giveaway":
+            await query.message.reply_text(
+                giveaway_dashboard_text(),
+                parse_mode="HTML",
+                reply_markup=giveaway_admin_keyboard(),
+            )
+        elif option == "admin_giveaway_wallets":
+            await query.message.reply_text(
+                giveaway_wallet_list_text(),
+                parse_mode="HTML",
+                reply_markup=giveaway_wallet_list_keyboard(),
+            )
+        elif option.startswith("admin_giveaway_delete_wallet_"):
+            if giveaway_data.get("status") == "active":
+                await query.message.reply_text(
+                    "⚠️ Pause the giveaway before deleting a sponsor wallet."
+                )
+                return
+            try:
+                wallet_index = int(option.rsplit("_", 1)[-1])
+                wallet = get_giveaway_sponsor_wallets()[wallet_index - 1]
+            except (ValueError, IndexError):
+                await query.message.reply_text("⚠️ That sponsor wallet no longer exists.")
+                return
+            confirm_keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Yes, Delete",
+                            callback_data=f"admin_giveaway_confirm_delete_wallet_{wallet_index}",
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Cancel", callback_data="admin_giveaway_wallets"
+                        ),
+                    ]
+                ]
+            )
+            await query.message.reply_text(
+                "⚠️ <b>Delete this sponsor wallet?</b>\n\n"
+                f"Address: <code>{wallet.get('address', 'Unknown')}</code>\n\n"
+                "Its encrypted credential will be removed from the giveaway.",
+                parse_mode="HTML",
+                reply_markup=confirm_keyboard,
+            )
+        elif option.startswith("admin_giveaway_confirm_delete_wallet_"):
+            if giveaway_data.get("status") == "active":
+                await query.message.reply_text(
+                    "⚠️ Pause the giveaway before deleting a sponsor wallet."
+                )
+                return
+            try:
+                wallet_index = int(option.rsplit("_", 1)[-1])
+                wallets = get_giveaway_sponsor_wallets()
+                removed_wallet = wallets.pop(wallet_index - 1)
+            except (ValueError, IndexError):
+                await query.message.reply_text("⚠️ That sponsor wallet no longer exists.")
+                return
+            giveaway_data["sponsor_wallets"] = wallets
+            sync_legacy_giveaway_wallet_fields()
+            save_giveaway()
+            await query.message.reply_text(
+                "✅ Sponsor wallet deleted:\n"
+                f"<code>{removed_wallet.get('address', 'Unknown')}</code>\n\n"
+                + giveaway_wallet_list_text(),
+                parse_mode="HTML",
+                reply_markup=giveaway_wallet_list_keyboard(),
+            )
+        elif option.startswith("admin_giveaway_delete_participant_"):
+            if giveaway_data.get("status") == "active":
+                await query.message.reply_text(
+                    "⚠️ Pause the giveaway before deleting a participant."
+                )
+                return
+            try:
+                participant_index = int(option.rsplit("_", 1)[-1])
+                participant = giveaway_data.get("participants", [])[
+                    participant_index - 1
+                ]
+            except (ValueError, IndexError):
+                await query.message.reply_text(
+                    "⚠️ That participant no longer exists. Refresh the participant list."
+                )
+                return
+            solana_address = giveaway_participant_solana_address(participant)
+            evm_address = giveaway_participant_evm_address(participant)
+            confirm_keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Yes, Delete",
+                            callback_data=(
+                                "admin_giveaway_confirm_delete_participant_"
+                                f"{participant_index}"
+                            ),
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Cancel",
+                            callback_data="admin_giveaway_participants",
+                        ),
+                    ]
+                ]
+            )
+            await query.message.reply_text(
+                "⚠️ <b>Delete this giveaway participant?</b>\n\n"
+                f"SOL: <code>{solana_address}</code>\n"
+                f"EVM: <code>{evm_address or 'Not provided (legacy entry)'}</code>\n\n"
+                "This removes both addresses from the participant list.",
+                parse_mode="HTML",
+                reply_markup=confirm_keyboard,
+            )
+        elif option.startswith("admin_giveaway_confirm_delete_participant_"):
+            if giveaway_data.get("status") == "active":
+                await query.message.reply_text(
+                    "⚠️ Pause the giveaway before deleting a participant."
+                )
+                return
+            try:
+                participant_index = int(option.rsplit("_", 1)[-1])
+                participants = giveaway_data.get("participants", [])
+                removed_participant = participants.pop(participant_index - 1)
+            except (ValueError, IndexError):
+                await query.message.reply_text(
+                    "⚠️ That participant no longer exists. Refresh the participant list."
+                )
+                return
+            giveaway_data["participants"] = participants
+            save_giveaway()
+            await query.message.reply_text(
+                "✅ Participant deleted:\n\n"
+                f"SOL: <code>{giveaway_participant_solana_address(removed_participant)}</code>\n"
+                f"EVM: <code>{giveaway_participant_evm_address(removed_participant) or 'Not provided (legacy entry)'}</code>\n\n"
+                + (
+                    "📋 No participants remain."
+                    if not participants
+                    else "📋 The participant list has been updated."
+                ),
+                parse_mode="HTML",
+                reply_markup=giveaway_participant_list_keyboard(),
+            )
+        elif option == "admin_giveaway_timer":
+            context.user_data["awaiting_giveaway_timer"] = True
+            await query.message.reply_text(
+                "⏱ <b>Set Giveaway Draw Timer</b>\n\n"
+                f"Current timer: <b>{format_giveaway_interval(get_giveaway_interval_seconds())}</b>\n\n"
+                "Choose a preset or send a custom duration such as "
+                "<code>6 hours</code>, <code>30 minutes</code>, "
+                "<code>45 seconds</code>, or a bare number of seconds.\n"
+                "The minimum timer is 1 second.",
+                parse_mode="HTML",
+                reply_markup=giveaway_timer_keyboard(),
+            )
+        elif option.startswith("admin_giveaway_timer_set_"):
+            try:
+                interval_seconds = int(option.rsplit("_", 1)[-1])
+            except ValueError:
+                await query.message.reply_text("⚠️ Invalid timer preset.")
+                return
+            context.user_data.pop("awaiting_giveaway_timer", None)
+            giveaway_data["draw_interval_seconds"] = interval_seconds
+            if giveaway_data.get("status") == "active":
+                giveaway_data["next_draw_at"] = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=interval_seconds)
+                ).isoformat()
+            save_giveaway()
+            await query.message.reply_text(
+                "✅ Giveaway timer set to "
+                f"<b>{format_giveaway_interval(interval_seconds)}</b>.\n\n"
+                "The next active draw has been scheduled using the new timer.",
+                parse_mode="HTML",
+                reply_markup=giveaway_admin_keyboard(),
+            )
+        elif option == "admin_giveaway_wallet":
+            if giveaway_data.get("status") == "active":
+                await query.message.reply_text(
+                    "⚠️ Pause the giveaway before changing its sponsor wallet."
+                )
+                return
+            context.user_data["awaiting_giveaway_wallet"] = True
+            await query.message.reply_text(
+                "🔐 <b>Add Sponsored Wallet</b>\n\n"
+                "Send either:\n"
+                "• A Solana seed phrase (12, 15, 18, 21, or 24 words), or\n"
+                "• A Solana private key (base58, JSON array, or hex)\n\n"
+                "Seed phrases use <code>m/44'/501'/X'/0'</code>. "
+                "X defaults to 0; to use another account, append "
+                "<code>| X</code> or send the full path after the phrase.\n\n"
+                "The message will be deleted immediately before the credential "
+                "is processed. It will be encrypted at rest and never displayed.\n\n"
+                "Type <b>Cancel</b> to stop.",
+                parse_mode="HTML",
+                reply_markup=cancel_markup(),
+            )
+        elif option == "admin_giveaway_create":
+            if giveaway_data.get("status") in ("active", "paused"):
+                await query.message.reply_text(
+                    "⚠️ Pause/finish the current giveaway before creating a new one."
+                )
+                return
+            giveaway_data.update(
+                {
+                    "status": "draft",
+                    "draw_interval_seconds": DEFAULT_DRAW_INTERVAL_SECONDS,
+                    "total_budget": 0.0,
+                    "payout_amount": 0.0,
+                    "max_rounds": 0,
+                    "rounds_paid": 0,
+                    "paid_total": 0.0,
+                    "created_at": None,
+                    "next_draw_at": None,
+                    "participants": [],
+                }
+            )
+            save_giveaway()
+            await query.message.reply_text(
+                "🎁 <b>New Giveaway Created</b>\n\n"
+                "Add the sponsored wallet and participant addresses, then tap "
+                "Start. Each draw will send the sponsored wallet's spendable SOL "
+                "plus all available SPL tokens.",
+                parse_mode="HTML",
+                reply_markup=giveaway_admin_keyboard(),
+            )
+        elif option == "admin_giveaway_add":
+            if giveaway_data.get("status") in ("inactive", "complete"):
+                await query.message.reply_text(
+                    "⚠️ Create a giveaway first, then add participant addresses."
+                )
+                return
+            context.user_data["awaiting_giveaway_participants"] = True
+            await query.message.reply_text(
+                "➕ <b>Add Giveaway Participants</b>\n\n"
+                "Add one participant per line using this format:\n"
+                "<code>SolanaAddress | EVMAddress</code>\n\n"
+                "Example:\n"
+                "<code>7h...abc | 0x742d35Cc6634C0532925a3b8D4C9B3A2d2E4f0bA</code>\n\n"
+                "Both addresses are required. The EVM address works on Ethereum, "
+                "BSC, Polygon, Arbitrum, Base, Avalanche, Optimism, and other "
+                "EVM-compatible networks. Duplicate Solana addresses are ignored.\n"
+                "Previous winners can win again.\n"
+                "Type <b>Cancel</b> to stop.",
+                parse_mode="HTML",
+                reply_markup=cancel_markup(),
+            )
+        elif option in ("admin_giveaway_status", "admin_giveaway_participants"):
+            if option == "admin_giveaway_status":
+                await query.edit_message_text(
+                    giveaway_dashboard_text(),
+                    parse_mode="HTML",
+                    reply_markup=giveaway_admin_keyboard(),
+                )
+            else:
+                participants = giveaway_data.get("participants", [])
+                if not participants:
+                    participant_text = "📋 <b>Participants</b>\n\nNo addresses have been added."
+                else:
+                    participant_text = (
+                        f"📋 <b>Participants ({len(participants)})</b>\n\n"
+                        + "\n".join(
+                            f"{index}. SOL: <code>{giveaway_participant_solana_address(participant)}</code>\n"
+                            f"   EVM: <code>{giveaway_participant_evm_address(participant) or 'Not provided (legacy entry)'}</code>"
+                            for index, participant in enumerate(participants, 1)
+                        )
+                    )
+                await query.message.reply_text(
+                    participant_text,
+                    parse_mode="HTML",
+                    reply_markup=giveaway_participant_list_keyboard(),
+                )
+        elif option == "admin_giveaway_start":
+            if giveaway_data.get("status") != "draft":
+                await query.message.reply_text("⚠️ Only a draft giveaway can be started.")
+                return
+            participants = giveaway_data.get("participants", [])
+            if not participants:
+                await query.message.reply_text(
+                    "⚠️ Add at least one participant wallet address first."
+                )
+                return
+            sponsor_wallets = get_giveaway_sponsor_wallets()
+            if not sponsor_wallets:
+                await query.message.reply_text(
+                    "⚠️ Add at least one sponsored wallet seed phrase or private key first."
+                )
+                return
+            try:
+                transfer_reserve_lamports = (
+                    await get_giveaway_transfer_reserve_lamports()
+                )
+                funded_addresses = []
+                for wallet in sponsor_wallets:
+                    sender = _keypair_from_sponsor_wallet(wallet)
+                    balance_response = await solana_client.get_balance(sender.pubkey())
+                    sponsor_lamports = int(balance_response.value or 0)
+                    if sponsor_lamports > transfer_reserve_lamports:
+                        funded_addresses.append(
+                            f"<code>{wallet.get('address', sender.pubkey())}</code>"
+                            f" ({sponsor_lamports / LAMPORTS_PER_SOL:.9f} SOL)"
+                        )
+            except Exception as e:
+                await query.message.reply_text(
+                    "❌ One of the sponsored wallet credentials could not be loaded. "
+                    "Please remove and add that wallet again.",
+                    parse_mode="HTML",
+                )
+                return
+            if not funded_addresses:
+                await query.message.reply_text(
+                    "⚠️ <b>No sponsor wallet is funded enough for the first draw.</b>\n\n"
+                    "At least one wallet must contain more than the rent-exempt "
+                    "balance plus the network-fee reserve.",
+                    parse_mode="HTML",
+                )
+                return
+            giveaway_data["status"] = "active"
+            giveaway_data["created_at"] = datetime.now(timezone.utc).isoformat()
+            giveaway_data["next_draw_at"] = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=get_giveaway_interval_seconds())
+            ).isoformat()
+            save_giveaway()
+            await query.message.reply_text(
+                "✅ <b>Giveaway started</b>\n\n"
+                f"Funded sponsor wallets: <b>{len(funded_addresses)}</b>\n"
+                "Each draw randomly selects a funded sponsor wallet and sends "
+                "its spendable SOL plus all available SPL tokens.\n"
+                f"The first random draw is scheduled in "
+                f"{format_giveaway_interval(get_giveaway_interval_seconds())}.\n"
+                "Previous winners remain eligible for future draws.",
+                parse_mode="HTML",
+                reply_markup=giveaway_admin_keyboard(),
+            )
+        elif option == "admin_giveaway_pause":
+            if giveaway_data.get("status") != "active":
+                await query.message.reply_text("⚠️ No active giveaway is running.")
+                return
+            giveaway_data["status"] = "paused"
+            save_giveaway()
+            await query.message.reply_text(
+                "⏸ <b>Giveaway paused.</b>\n\n"
+                "No payouts will be made until you resume it.",
+                parse_mode="HTML",
+                reply_markup=giveaway_admin_keyboard(),
+            )
+        elif option == "admin_giveaway_resume":
+            if giveaway_data.get("status") != "paused":
+                await query.message.reply_text("⚠️ No paused giveaway is available.")
+                return
+            giveaway_data["status"] = "active"
+            giveaway_data["next_draw_at"] = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=get_giveaway_interval_seconds())
+            ).isoformat()
+            save_giveaway()
+            await query.message.reply_text(
+                "▶️ <b>Giveaway resumed.</b>\n\n"
+                "The next draw will run automatically on the next scheduler check.",
+                parse_mode="HTML",
+                reply_markup=giveaway_admin_keyboard(),
+            )
+        elif option == "admin_giveaway_history":
+            history = giveaway_data.get("history", [])
+            if not history:
+                history_text = "🏆 <b>Payout History</b>\n\nNo payouts have been sent."
+            else:
+                recent = history[-20:]
+                history_text = "🏆 <b>Recent Payouts</b>\n\n" + "\n\n".join(
+                    f"{index}. <b>{float(item.get('amount', 0)):.9f} SOL</b> → "
+                    f"<code>{item.get('winner', 'Unknown')}</code>\n"
+                    f"🕒 {format_giveaway_time(item.get('timestamp'))}\n"
+                    f"🔗 <code>{item.get('signature', 'Unknown')}</code>"
+                    for index, item in enumerate(recent, max(1, len(history) - len(recent) + 1))
+                )
+            await query.message.reply_text(
+                history_text,
+                parse_mode="HTML",
+                reply_markup=giveaway_admin_keyboard(),
+            )
+        elif option == "admin_giveaway_close":
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
         elif option.startswith("admin_edit_"):
             parts = option.split("_")
             field = parts[2]       # balance | ethbal | bnbbal | minw
@@ -2208,6 +3403,207 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Handle Admin inputs
     if user_id in ADMIN_IDS:
+        if context.user_data.get("awaiting_giveaway_timer"):
+            timer_input = text.strip()
+            context.user_data.pop("awaiting_giveaway_timer", None)
+            if timer_input.lower() == "cancel":
+                await update.message.reply_text(
+                    "❌ Timer change cancelled.",
+                    reply_markup=giveaway_admin_keyboard(),
+                )
+                return
+            try:
+                interval_seconds = parse_giveaway_interval(timer_input)
+            except ValueError as error:
+                context.user_data["awaiting_giveaway_timer"] = True
+                await update.message.reply_text(
+                    f"❌ {error}\n\n"
+                    "Examples: <code>6 hours</code>, <code>30 minutes</code>, "
+                    "<code>45 seconds</code>, or <code>1800</code>.",
+                    parse_mode="HTML",
+                    reply_markup=cancel_markup(),
+                )
+                return
+
+            giveaway_data["draw_interval_seconds"] = interval_seconds
+            if giveaway_data.get("status") == "active":
+                giveaway_data["next_draw_at"] = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=interval_seconds)
+                ).isoformat()
+            save_giveaway()
+            await update.message.reply_text(
+                "✅ Giveaway timer set to "
+                f"<b>{format_giveaway_interval(interval_seconds)}</b>.\n\n"
+                "The new timer will be used for the next draw.",
+                parse_mode="HTML",
+                reply_markup=giveaway_admin_keyboard(),
+            )
+            return
+
+        if context.user_data.get("awaiting_giveaway_wallet"):
+            credential_input = text.strip()
+            context.user_data.pop("awaiting_giveaway_wallet", None)
+
+            # Delete the incoming Telegram message before parsing or saving
+            # the credential. Do not continue if Telegram cannot delete it.
+            try:
+                await update.message.delete()
+            except Exception:
+                await update.message.reply_text(
+                    "⚠️ For security, the sponsored wallet was not saved because "
+                    "the credential message could not be deleted. Delete it "
+                    "manually and try again in a private admin chat.",
+                    reply_markup=giveaway_admin_keyboard(),
+                )
+                return
+
+            if credential_input.lower() == "cancel":
+                await update.message.reply_text(
+                    "❌ Sponsored wallet setup cancelled.",
+                    reply_markup=giveaway_admin_keyboard(),
+                )
+                return
+
+            try:
+                credential, credential_type, derivation_index = (
+                    _parse_giveaway_wallet_input(credential_input)
+                )
+                sender = _keypair_from_giveaway_credential(
+                    credential, credential_type, derivation_index
+                )
+                encrypted_credential = _encrypt_giveaway_credential(credential)
+            except Exception:
+                await update.message.reply_text(
+                    "❌ Invalid Solana seed phrase/private key, or secure storage "
+                    "is not configured. Nothing was saved.",
+                    reply_markup=giveaway_admin_keyboard(),
+                )
+                return
+
+            sponsor_wallets = get_giveaway_sponsor_wallets()
+            address = str(sender.pubkey())
+            if any(wallet.get("address") == address for wallet in sponsor_wallets):
+                await update.message.reply_text(
+                    "ℹ️ This sponsored wallet is already in the list.",
+                    reply_markup=giveaway_admin_keyboard(),
+                )
+                return
+
+            sponsor_wallets.append(
+                {
+                    "credential": encrypted_credential,
+                    "credential_type": credential_type,
+                    "address": address,
+                    "derivation_index": derivation_index,
+                }
+            )
+            giveaway_data["sponsor_wallets"] = sponsor_wallets
+            # Keep legacy fields synchronized for older tools that inspect
+            # giveaway.json, without storing an additional plaintext secret.
+            giveaway_data["sender_credential"] = encrypted_credential
+            giveaway_data["sender_credential_type"] = credential_type
+            giveaway_data["sender_address"] = address
+            save_giveaway()
+            path_text = (
+                f"\nPath: <code>m/44'/501'/{derivation_index}'/0'</code>"
+                if credential_type == "seed_phrase"
+                else ""
+            )
+            await update.message.reply_text(
+                "✅ <b>Sponsored wallet added securely</b>\n\n"
+                f"Type: <b>{'Seed phrase' if credential_type == 'seed_phrase' else 'Private key'}</b>\n"
+                f"Address: <code>{address}</code>{path_text}\n"
+                f"Total sponsor wallets: <b>{len(sponsor_wallets)}</b>\n\n"
+                "The credential was deleted from the incoming message and is "
+                "stored encrypted. Fund this address before starting the giveaway. "
+                "Use Add Sponsor Wallet again to add another wallet.",
+                parse_mode="HTML",
+                reply_markup=giveaway_admin_keyboard(),
+            )
+            return
+
+        if context.user_data.get("awaiting_giveaway_participants"):
+            if text.lower() == "cancel":
+                context.user_data.pop("awaiting_giveaway_participants", None)
+                await update.message.reply_text(
+                    "✅ Participant entry finished.",
+                    reply_markup=giveaway_admin_keyboard(),
+                )
+                return
+
+            candidate_records = []
+            invalid_records = []
+            for line in text.splitlines():
+                candidate = line.strip()
+                if not candidate:
+                    continue
+                fields = re.split(r"\s*\|\s*|\s*,\s*", candidate)
+                if len(fields) != 2:
+                    whitespace_fields = candidate.split()
+                    if len(whitespace_fields) == 2:
+                        fields = whitespace_fields
+                if len(fields) != 2:
+                    invalid_records.append(candidate)
+                    continue
+                try:
+                    participant = {
+                        "solana_address": canonical_giveaway_solana_address(fields[0]),
+                        "evm_address": canonical_giveaway_evm_address(fields[1]),
+                    }
+                except ValueError:
+                    invalid_records.append(candidate)
+                    continue
+                candidate_records.append(participant)
+
+            valid_records = []
+            invalid_addresses = invalid_records
+            existing = {
+                giveaway_participant_solana_address(participant)
+                for participant in giveaway_data.get("participants", [])
+            }
+            for participant in candidate_records:
+                solana_address = participant["solana_address"]
+                if (
+                    solana_address not in existing
+                    and all(
+                        item["solana_address"] != solana_address
+                        for item in valid_records
+                    )
+                ):
+                    valid_records.append(participant)
+
+            if valid_records:
+                giveaway_data.setdefault("participants", []).extend(valid_records)
+                save_giveaway()
+
+            response = []
+            if valid_records:
+                response.append(
+                    f"✅ Added <b>{len(valid_records)}</b> participant(s) with Solana and EVM addresses."
+                )
+            if invalid_addresses:
+                response.append(
+                    "❌ Invalid participant line(s). Use "
+                    "<code>SolanaAddress | EVMAddress</code>:\n"
+                    + "\n".join(
+                        f"<code>{value}</code>" for value in invalid_addresses[:10]
+                    )
+                )
+            if not response:
+                response.append(
+                    "ℹ️ All submitted Solana addresses were already in the list."
+                )
+            response.append(
+                "\nSend more participant pairs or type <b>Cancel</b> when finished."
+            )
+            await update.message.reply_text(
+                "\n\n".join(response),
+                parse_mode="HTML",
+                reply_markup=cancel_markup(),
+            )
+            return
+
         if context.user_data.get("awaiting_admin_ban"):
             try:
                 target_id = int(text.strip())
@@ -3155,15 +4551,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("🎁 Sponsored Giveaway", callback_data="admin_giveaway")],
             [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban")],
             [InlineKeyboardButton("✅ Unban User", callback_data="admin_unban")],
             [InlineKeyboardButton("📜 Banned List", callback_data="admin_list_banned")],
-            [InlineKeyboardButton("📋 All Wallet Addresses", callback_data="admin_list_wallets")],
-            [
-                InlineKeyboardButton("🔎 Scan Solana Live", callback_data="admin_scan_solana"),
-                InlineKeyboardButton("🔎 Scan EVM Live", callback_data="admin_scan_evm"),
-            ],
-            [InlineKeyboardButton("🔎 Scan Both Live", callback_data="admin_scan_wallets")],
             [
                 InlineKeyboardButton(
                     "👤 User Details", callback_data="admin_user_details"
@@ -3196,9 +4587,15 @@ def main():
 
     # Start background deposit monitoring (runs every 30 seconds) new
     app.job_queue.run_repeating(background_deposit_monitor, interval=30, first=10)
+    # The persisted next_draw_at keeps the configured schedule stable across
+    # bot restarts.
+    # Check once per second so admin-configured second-level timers are
+    # honored. The draw function only calls Solana when a draw is due.
+    app.job_queue.run_repeating(process_giveaway_draw, interval=1, first=20)
 
     print("Bot is running...")
     print("Background deposit monitoring started (checks every 30 seconds)...")
+    print("Sponsored giveaway scheduler started (checks every second)...")
     app.run_polling()
 
 
