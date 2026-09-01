@@ -7,6 +7,7 @@ import hmac
 import base64
 from html import escape as html_escape
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from mnemonic import Mnemonic
 from eth_account import Account
 from eth_utils import is_address, to_checksum_address
@@ -49,7 +50,8 @@ from telegram.ext import (
 )
 
 # Load environment variables
-load_dotenv()
+PROJECT_DIR = Path(__file__).resolve().parent
+load_dotenv(PROJECT_DIR / ".env")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 # Store temporary user states
 user_states = {}
@@ -3473,7 +3475,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     credential, credential_type, derivation_index
                 )
                 encrypted_credential = _encrypt_giveaway_credential(credential)
-            except Exception:
+            except Exception as error:
+                # Keep Telegram's response generic, but make the safe cause
+                # visible in VPS service logs. Never log the credential itself.
+                if isinstance(error, ValueError):
+                    print(
+                        "Giveaway wallet setup rejected: "
+                        f"{error}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "Giveaway wallet setup failed: "
+                        f"{type(error).__name__}",
+                        flush=True,
+                    )
                 await update.message.reply_text(
                     "❌ Invalid Solana seed phrase/private key, or secure storage "
                     "is not configured. Nothing was saved.",
