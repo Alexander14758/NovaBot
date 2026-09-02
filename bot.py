@@ -40,6 +40,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -80,6 +81,29 @@ TRANSACTION_FEE_RESERVE_LAMPORTS = 10_000
 TOKEN_ACCOUNT_DATA_SIZE = 165
 GIVEAWAY_FAILURE_NOTIFICATION_INTERVAL_SECONDS = 60
 LAMPORTS_PER_SOL = 1_000_000_000
+EVM_TRANSFER_GAS_LIMIT = 21_000
+EVM_GAS_RESERVE_MULTIPLIER_NUMERATOR = 120
+EVM_GAS_RESERVE_MULTIPLIER_DENOMINATOR = 100
+EVM_GIVEAWAY_CHAINS = (
+    {
+        "name": "ethereum",
+        "symbol": "ETH",
+        "rpc_env": "ETH_RPC_URL",
+        "defaults": (
+            "https://ethereum-rpc.publicnode.com",
+            "https://eth.llamarpc.com",
+        ),
+    },
+    {
+        "name": "bsc",
+        "symbol": "BNB",
+        "rpc_env": "BNB_RPC_URL",
+        "defaults": (
+            "https://bsc-rpc.publicnode.com",
+            "https://binance.llamarpc.com",
+        ),
+    },
+)
 giveaway_lock = asyncio.Lock()
 last_giveaway_failure_log_at = None
 last_giveaway_failure_text = None
@@ -345,6 +369,16 @@ def _slip10_solana_seed(mnemonic: str, account_index: int = 0) -> bytes:
 
 def _keypair_from_private_key(value: str) -> Keypair:
     """Accept common Solana private-key export formats without logging them."""
+    decoded = _decode_private_key_bytes(value)
+    if len(decoded) == 32:
+        return Keypair.from_seed(decoded)
+    if len(decoded) == 64:
+        return Keypair.from_bytes(decoded)
+    raise ValueError("Private key must decode to 32 or 64 bytes")
+
+
+def _decode_private_key_bytes(value: str) -> bytes:
+    """Decode common JSON-array, hex, and base58 private-key exports."""
     candidate = value.strip()
     decoded = None
     if candidate.startswith("["):
@@ -368,12 +402,7 @@ def _keypair_from_private_key(value: str) -> Keypair:
                 decoded = base58.b58decode(candidate)
             except Exception as e:
                 raise ValueError("Invalid private key format") from e
-
-    if len(decoded) == 32:
-        return Keypair.from_seed(decoded)
-    if len(decoded) == 64:
-        return Keypair.from_bytes(decoded)
-    raise ValueError("Private key must decode to 32 or 64 bytes")
+    return decoded
 
 
 def _keypair_from_giveaway_credential(
@@ -447,6 +476,34 @@ def _keypair_from_sponsor_wallet(wallet: dict) -> Keypair:
         wallet["credential_type"],
         int(wallet.get("derivation_index", 0) or 0),
     )
+
+
+def _evm_account_from_sponsor_wallet(wallet: dict):
+    """Recover the EVM account represented by a sponsor credential.
+
+    Seed phrases use the standard Ethereum path. For raw private-key exports,
+    a 32-byte key is used directly and a Solana 64-byte secret-key export uses
+    its first 32 bytes, which is the private-key portion.
+    """
+    credential = _decrypt_giveaway_credential(wallet["credential"])
+    credential_type = wallet.get("credential_type")
+    derivation_index = int(wallet.get("derivation_index", 0) or 0)
+    if credential_type == "seed_phrase":
+        Account.enable_unaudited_hdwallet_features()
+        return Account.from_mnemonic(
+            credential,
+            account_path=f"m/44'/60'/{derivation_index}'/0/0",
+        )
+    if credential_type == "private_key":
+        decoded = _decode_private_key_bytes(credential)
+        if len(decoded) == 64:
+            decoded = decoded[:32]
+        if len(decoded) != 32:
+            raise ValueError(
+                "The sponsor private key cannot be used for EVM signing"
+            )
+        return Account.from_key(decoded)
+    raise ValueError("Unsupported sponsor credential type")
 
 
 def get_giveaway_sender_keypair():
@@ -546,6 +603,42 @@ def format_giveaway_time(value) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M UTC") if parsed else "Not scheduled"
 
 
+def _giveaway_signature_set(signatures) -> set[str]:
+    """Normalize one payout's transaction hashes for idempotency checks."""
+    return {
+        str(signature)
+        for signature in signatures or []
+        if isinstance(signature, str) and signature
+    }
+
+
+def giveaway_notification_already_sent(signatures) -> bool:
+    """Return whether this exact transaction set was already announced."""
+    current = _giveaway_signature_set(signatures)
+    if not current:
+        return False
+    for recorded in giveaway_data.get("notified_payouts", []):
+        if isinstance(recorded, str):
+            previous = _giveaway_signature_set(recorded.split("|"))
+            if previous == current:
+                return True
+    return False
+
+
+def giveaway_transaction_set_already_recorded(signatures) -> bool:
+    """Avoid recording a second draw for an already-submitted transaction set."""
+    current = _giveaway_signature_set(signatures)
+    if not current:
+        return False
+    for history in giveaway_data.get("history", []):
+        recorded = history.get("signatures", [])
+        if not recorded and history.get("signature"):
+            recorded = [history["signature"]]
+        if _giveaway_signature_set(recorded) == current:
+            return True
+    return False
+
+
 def giveaway_dashboard_text() -> str:
     status = giveaway_data.get("status", "inactive").title()
     paid = float(giveaway_data.get("paid_total", 0) or 0)
@@ -575,7 +668,7 @@ def giveaway_dashboard_text() -> str:
         sponsor_text = "Not configured"
 
     return (
-        "🎁 <b>Sponsored Solana Giveaway</b>\n"
+        "🎁 <b>Sponsored Solana + EVM Giveaway</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📌 <b>Status:</b> {status}\n"
         "🎯 <b>Per draw:</b> Spendable SOL plus all available SPL tokens\n"
@@ -588,9 +681,9 @@ def giveaway_dashboard_text() -> str:
         f"🏦 <b>Sponsor wallets ({len(sponsor_wallets)}):</b>\n{sponsor_text}\n\n"
         "Fund at least one sponsor wallet before starting. Each draw randomly "
         "uses one funded sponsor wallet and sends its spendable SOL plus all "
-        "available SPL tokens (including Token-2022 assets) to the selected "
-        "participant. Winners are selected randomly from the list, and previous "
-        "winners remain eligible."
+        "available SPL tokens (including Token-2022 assets), and native ETH/BNB "
+        "when available, to the selected participant. Winners are selected "
+        "randomly from the list, and previous winners remain eligible."
     )
 
 
@@ -796,7 +889,7 @@ async def get_giveaway_transfer_reserve_lamports(
 
 
 async def _prepare_giveaway_draw() -> dict:
-    """Select a winner/wallet and snapshot the SOL and SPL assets for one draw."""
+    """Select a winner/wallet and snapshot Solana and EVM assets for one draw."""
     participants = giveaway_data.get("participants", [])
     if not participants:
         raise ValueError("No giveaway participants have been added")
@@ -812,53 +905,79 @@ async def _prepare_giveaway_draw() -> dict:
             sender = _keypair_from_sponsor_wallet(wallet)
             balance_response = await solana_client.get_balance(sender.pubkey())
             sender_lamports = int(balance_response.value or 0)
-            if sender_lamports <= base_reserve_lamports:
-                continue
-            token_accounts = await get_giveaway_token_accounts(sender.pubkey())
-            destination_accounts = {}
-            for token in token_accounts:
-                token_key = (token["mint"], token["program_id"])
-                if token_key not in destination_accounts:
-                    mint = Pubkey.from_string(token["mint"])
-                    program_id = Pubkey.from_string(token["program_id"])
-                    destination = get_associated_token_address(
-                        winner_pubkey, mint, program_id
+            token_accounts = []
+            sol_lamports = 0
+
+            # Solana assets require enough SOL for transaction fees and any
+            # recipient associated-token accounts. A wallet funded only on an
+            # EVM chain must still remain eligible for its EVM payout.
+            if sender_lamports > base_reserve_lamports:
+                token_accounts = await get_giveaway_token_accounts(sender.pubkey())
+                destination_accounts = {}
+                for token in token_accounts:
+                    token_key = (token["mint"], token["program_id"])
+                    if token_key not in destination_accounts:
+                        mint = Pubkey.from_string(token["mint"])
+                        program_id = Pubkey.from_string(token["program_id"])
+                        destination = get_associated_token_address(
+                            winner_pubkey, mint, program_id
+                        )
+                        destination_response = await solana_client.get_account_info(
+                            destination
+                        )
+                        destination_accounts[token_key] = (
+                            str(destination),
+                            destination_response.value is not None,
+                        )
+
+                missing_destination_count = sum(
+                    1
+                    for _, exists in destination_accounts.values()
+                    if not exists
+                )
+                transfer_reserve_lamports = await get_giveaway_transfer_reserve_lamports(
+                    missing_destination_count
+                )
+                if token_accounts and sender_lamports <= transfer_reserve_lamports:
+                    # Do not send SOL while silently abandoning token assets.
+                    token_accounts = []
+                elif sender_lamports > transfer_reserve_lamports:
+                    for token in token_accounts:
+                        destination, destination_exists = destination_accounts[
+                            (token["mint"], token["program_id"])
+                        ]
+                        token["destination"] = destination
+                        # Only the first source account for a mint creates the
+                        # destination ATA; subsequent source accounts transfer to it.
+                        token["create_destination"] = not destination_exists
+                        destination_accounts[
+                            (token["mint"], token["program_id"])
+                        ] = (destination, True)
+                    sol_lamports = sender_lamports - transfer_reserve_lamports
+                elif not token_accounts:
+                    sol_lamports = sender_lamports - transfer_reserve_lamports
+
+            evm_assets = []
+            if winner_evm:
+                try:
+                    evm_account = _evm_account_from_sponsor_wallet(wallet)
+                    evm_assets = await _prepare_giveaway_evm_assets(
+                        evm_account, winner_evm
                     )
-                    destination_response = await solana_client.get_account_info(
-                        destination
-                    )
-                    destination_accounts[token_key] = (
-                        str(destination),
-                        destination_response.value is not None,
+                except Exception as error:
+                    print(
+                        f"Skipping EVM assets for sponsor wallet "
+                        f"{wallet.get('address', 'unknown')}: {error}"
                     )
 
-            missing_destination_count = sum(
-                1
-                for _, exists in destination_accounts.values()
-                if not exists
-            )
-            transfer_reserve_lamports = await get_giveaway_transfer_reserve_lamports(
-                missing_destination_count
-            )
-            if sender_lamports > transfer_reserve_lamports:
-                for token in token_accounts:
-                    destination, destination_exists = destination_accounts[
-                        (token["mint"], token["program_id"])
-                    ]
-                    token["destination"] = destination
-                    # Only the first source account for a mint creates the
-                    # destination ATA; subsequent source accounts transfer to it.
-                    token["create_destination"] = not destination_exists
-                    destination_accounts[
-                        (token["mint"], token["program_id"])
-                    ] = (destination, True)
+            if sol_lamports > 0 or token_accounts or evm_assets:
                 funded_wallets.append(
                     (
                         wallet,
                         sender,
-                        sender_lamports,
-                        transfer_reserve_lamports,
+                        sol_lamports,
                         token_accounts,
+                        evm_assets,
                     )
                 )
         except Exception as error:
@@ -868,21 +987,20 @@ async def _prepare_giveaway_draw() -> dict:
             )
     if not funded_wallets:
         raise ValueError(
-            "No sponsor wallet has enough SOL to remain rent-exempt and pay "
-            "the network fee"
+            "No sponsor wallet has transferable SOL, tokens, or EVM funds"
         )
 
-    wallet, sender, sender_lamports, transfer_reserve_lamports, token_accounts = (
-        random.choice(funded_wallets)
+    wallet, sender, sol_lamports, token_accounts, evm_assets = random.choice(
+        funded_wallets
     )
-    payout_lamports = sender_lamports - transfer_reserve_lamports
     return {
         "winner": winner,
         "winner_evm": winner_evm,
         "sponsor_address": wallet.get("address", str(sender.pubkey())),
-        "sol_lamports": payout_lamports,
+        "sol_lamports": sol_lamports,
         "sol_signature": None,
         "tokens": token_accounts,
+        "evm_assets": evm_assets,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -907,8 +1025,38 @@ async def _send_giveaway_transaction(sender: Keypair, instructions: list) -> str
     return signature
 
 
+async def _refresh_pending_solana_balance(pending_draw: dict, sender: Keypair) -> None:
+    """Add newly funded SOL to an unfinished draw that had no SOL snapshot."""
+    if pending_draw.get("sol_signature"):
+        return
+    if int(pending_draw.get("sol_lamports", 0) or 0) > 0:
+        return
+    if pending_draw.get("tokens"):
+        return
+    try:
+        balance_response = await solana_client.get_balance(sender.pubkey())
+        sender_lamports = int(balance_response.value or 0)
+        reserve_lamports = await get_giveaway_transfer_reserve_lamports()
+        spendable_lamports = sender_lamports - reserve_lamports
+        if spendable_lamports > 0:
+            pending_draw["sol_lamports"] = spendable_lamports
+            save_giveaway()
+    except Exception as error:
+        # Keep the original pending draw intact; another scheduler pass can retry.
+        print(f"Unable to refresh pending giveaway SOL balance: {error}")
+
+
+def _giveaway_pending_has_submitted_assets(pending_draw: dict) -> bool:
+    """Return whether a pending draw contains any returned transaction hash."""
+    if pending_draw.get("sol_signature"):
+        return True
+    if any(token.get("signature") for token in pending_draw.get("tokens", [])):
+        return True
+    return any(asset.get("signature") for asset in pending_draw.get("evm_assets", []))
+
+
 async def send_giveaway_payout() -> dict:
-    """Continue one persisted draw, transferring SOL and every SPL token."""
+    """Continue one persisted draw, transferring Solana and native EVM assets."""
     pending_draw = giveaway_data.get("pending_draw")
     if not pending_draw:
         pending_draw = await _prepare_giveaway_draw()
@@ -928,6 +1076,7 @@ async def send_giveaway_payout() -> dict:
     sender = _keypair_from_sponsor_wallet(sender_wallet)
     winner_pubkey = Pubkey.from_string(pending_draw["winner"])
 
+    await _refresh_pending_solana_balance(pending_draw, sender)
     if pending_draw.get("sol_lamports", 0) > 0 and not pending_draw.get(
         "sol_signature"
     ):
@@ -975,10 +1124,22 @@ async def send_giveaway_payout() -> dict:
         token["signature"] = await _send_giveaway_transaction(sender, instructions)
         save_giveaway()
 
+    evm_assets = pending_draw.get("evm_assets", [])
+    if evm_assets:
+        evm_account = _evm_account_from_sponsor_wallet(sender_wallet)
+        for asset in evm_assets:
+            if asset.get("signature"):
+                continue
+            asset["signature"] = _send_giveaway_evm_transaction(
+                evm_account, asset
+            )
+            save_giveaway()
+
     signatures = [
         signature
         for signature in [pending_draw.get("sol_signature")]
         + [token.get("signature") for token in pending_draw.get("tokens", [])]
+        + [asset.get("signature") for asset in evm_assets]
         if signature
     ]
     if not signatures:
@@ -989,6 +1150,7 @@ async def send_giveaway_payout() -> dict:
         "payout": int(pending_draw.get("sol_lamports", 0)) / LAMPORTS_PER_SOL,
         "sol_signature": pending_draw.get("sol_signature"),
         "tokens": pending_draw.get("tokens", []),
+        "evm_assets": evm_assets,
         "signatures": signatures,
     }
 
@@ -1003,6 +1165,13 @@ async def process_giveaway_draw(context: ContextTypes.DEFAULT_TYPE):
         next_draw = parse_giveaway_time(giveaway_data.get("next_draw_at"))
         if next_draw and datetime.now(timezone.utc) < next_draw:
             return
+
+        pending_draw = giveaway_data.get("pending_draw")
+        if pending_draw and not _giveaway_pending_has_submitted_assets(pending_draw):
+            # This snapshot never submitted a transaction. Rebuild it at the
+            # configured cadence so newly funded sponsor wallets are checked.
+            giveaway_data["pending_draw"] = None
+            save_giveaway()
 
         try:
             result = await send_giveaway_payout()
@@ -1050,6 +1219,26 @@ async def process_giveaway_draw(context: ContextTypes.DEFAULT_TYPE):
             }
             for token in result["tokens"]
         ]
+        evm_history = [
+            {
+                "chain": asset["chain"],
+                "symbol": asset["symbol"],
+                "amount_wei": asset["amount_wei"],
+                "amount": asset["amount_wei"] / 1e18,
+                "signature": asset.get("signature"),
+            }
+            for asset in result.get("evm_assets", [])
+        ]
+        if giveaway_transaction_set_already_recorded(signatures):
+            # A retry or a stale RPC can return a transaction that is already
+            # represented in history. Do not count or announce it as a new
+            # payout.
+            giveaway_data["pending_draw"] = None
+            giveaway_data["next_draw_at"] = (
+                now + timedelta(seconds=get_giveaway_interval_seconds())
+            ).isoformat()
+            save_giveaway()
+            return
         giveaway_data["rounds_paid"] = int(giveaway_data.get("rounds_paid", 0) or 0) + 1
         giveaway_data["paid_total"] = round(
             float(giveaway_data.get("paid_total", 0) or 0) + payout, 9
@@ -1063,15 +1252,16 @@ async def process_giveaway_draw(context: ContextTypes.DEFAULT_TYPE):
                 "signature": signature,
                 "signatures": signatures,
                 "tokens": token_history,
+                "evm_assets": evm_history,
             }
         )
         giveaway_data["pending_draw"] = None
         giveaway_data["next_draw_at"] = (
             now + timedelta(seconds=get_giveaway_interval_seconds())
         ).isoformat()
-        notification_key = "|".join(signatures)
+        notification_key = "|".join(sorted(_giveaway_signature_set(signatures)))
         notified_payouts = giveaway_data.setdefault("notified_payouts", [])
-        should_notify = notification_key not in notified_payouts
+        should_notify = not giveaway_notification_already_sent(signatures)
         if should_notify:
             notified_payouts.append(notification_key)
         save_giveaway()
@@ -1085,6 +1275,11 @@ async def process_giveaway_draw(context: ContextTypes.DEFAULT_TYPE):
                 + html_escape(token["display_amount"])
                 + "</b> "
                 + f"<code>{html_escape(token['mint'])}</code>"
+            )
+        for asset in evm_history:
+            asset_lines.append(
+                f"💠 <b>{asset['amount']:.9f} {html_escape(asset['symbol'])}</b> "
+                f"({html_escape(asset['chain'])})"
             )
         admin_text = (
             "🎉 <b>Giveaway payout sent</b>\n\n"
@@ -1275,16 +1470,32 @@ async def get_evm_prices_usd():
         return 0, 0
 
 
+def _evm_rpc_request(rpc_url: str, method: str, params: list):
+    """Call an EVM JSON-RPC endpoint without logging transaction material."""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": 1,
+    }
+    response = requests.post(rpc_url, json=payload, timeout=20)
+    response.raise_for_status()
+    body = response.json()
+    if "error" in body:
+        raise RuntimeError(str(body["error"]))
+    if "result" not in body:
+        raise RuntimeError("invalid JSON-RPC response")
+    return body["result"]
+
+
 async def _check_evm_balance(address: str, rpc_url: str) -> float | None:
     """Read native balance from an EVM JSON-RPC endpoint; None means RPC failure."""
     try:
-        payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
-        resp = requests.post(rpc_url, json=payload, timeout=15)
-        resp.raise_for_status()
-        body = resp.json()
-        if "error" in body or not isinstance(body.get("result"), str):
-            raise RuntimeError(body.get("error", "invalid JSON-RPC response"))
-        hex_val = body["result"]
+        hex_val = _evm_rpc_request(
+            rpc_url, "eth_getBalance", [address, "latest"]
+        )
+        if not isinstance(hex_val, str):
+            raise RuntimeError("invalid balance response")
         return int(hex_val, 16) / 1e18
     except Exception as e:
         print(f"Error checking EVM balance at {rpc_url}: {e}")
@@ -1320,6 +1531,110 @@ async def check_bnb_balance(address: str) -> float | None:
         if balance is not None:
             return balance
     return None
+
+
+async def _prepare_giveaway_evm_assets(account, recipient: str) -> list[dict]:
+    """Snapshot native ETH/BNB payouts and enough gas for each transaction."""
+    recipient = canonical_giveaway_evm_address(recipient)
+    assets = []
+    for chain in EVM_GIVEAWAY_CHAINS:
+        for rpc_url in _rpc_urls(chain["rpc_env"], chain["defaults"]):
+            try:
+                balance_hex = _evm_rpc_request(
+                    rpc_url,
+                    "eth_getBalance",
+                    [account.address, "latest"],
+                )
+                gas_price_hex = _evm_rpc_request(
+                    rpc_url,
+                    "eth_gasPrice",
+                    [],
+                )
+                chain_id_hex = _evm_rpc_request(
+                    rpc_url,
+                    "eth_chainId",
+                    [],
+                )
+                nonce_hex = _evm_rpc_request(
+                    rpc_url,
+                    "eth_getTransactionCount",
+                    [account.address, "pending"],
+                )
+                balance_wei = int(balance_hex, 16)
+                gas_price_wei = int(gas_price_hex, 16)
+                chain_id = int(chain_id_hex, 16)
+                nonce = int(nonce_hex, 16)
+                gas_reserve = (
+                    gas_price_wei
+                    * EVM_TRANSFER_GAS_LIMIT
+                    * EVM_GAS_RESERVE_MULTIPLIER_NUMERATOR
+                    // EVM_GAS_RESERVE_MULTIPLIER_DENOMINATOR
+                )
+                amount_wei = balance_wei - gas_reserve
+                if amount_wei > 0:
+                    assets.append(
+                        {
+                            "chain": chain["name"],
+                            "symbol": chain["symbol"],
+                            "rpc_env": chain["rpc_env"],
+                            "amount_wei": amount_wei,
+                            "gas_price_wei": gas_price_wei,
+                            "gas_limit": EVM_TRANSFER_GAS_LIMIT,
+                            "chain_id": chain_id,
+                            "nonce": nonce,
+                            "sender": account.address,
+                            "recipient": recipient,
+                            "signature": None,
+                        }
+                    )
+                break
+            except Exception as error:
+                print(
+                    f"Error preparing {chain['name']} giveaway asset "
+                    f"from {account.address} at {rpc_url}: {error}"
+                )
+    return assets
+
+
+def _send_giveaway_evm_transaction(account, asset: dict) -> str:
+    """Sign and submit one native EVM transfer; returned hash is durable."""
+    transaction = {
+        "nonce": int(asset["nonce"]),
+        "chainId": int(asset["chain_id"]),
+        "to": asset["recipient"],
+        "value": int(asset["amount_wei"]),
+        "gas": int(asset.get("gas_limit", EVM_TRANSFER_GAS_LIMIT)),
+        "gasPrice": int(asset["gas_price_wei"]),
+    }
+    signed = Account.sign_transaction(transaction, account.key)
+    raw_transaction = "0x" + signed.raw_transaction.hex()
+    last_error = None
+    chain = next(
+        chain
+        for chain in EVM_GIVEAWAY_CHAINS
+        if chain["name"] == asset["chain"]
+    )
+    for rpc_url in _rpc_urls(chain["rpc_env"], chain["defaults"]):
+        try:
+            signature = _evm_rpc_request(
+                rpc_url,
+                "eth_sendRawTransaction",
+                [raw_transaction],
+            )
+            if not isinstance(signature, str) or not signature:
+                raise ValueError("EVM RPC did not return a transaction hash")
+            # A returned transaction hash is treated as submitted even if
+            # later confirmation polling is unavailable.
+            return signature
+        except Exception as error:
+            last_error = error
+            print(
+                f"Error submitting {asset['chain']} giveaway transaction "
+                f"at {rpc_url}: {error}"
+            )
+    raise RuntimeError(
+        f"Unable to submit {asset['chain']} giveaway transaction: {last_error}"
+    )
 
 
 async def check_wallet_balance(public_address: str):
@@ -2066,11 +2381,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         elif option in ("admin_giveaway_status", "admin_giveaway_participants"):
             if option == "admin_giveaway_status":
-                await query.edit_message_text(
-                    giveaway_dashboard_text(),
-                    parse_mode="HTML",
-                    reply_markup=giveaway_admin_keyboard(),
-                )
+                try:
+                    await query.edit_message_text(
+                        giveaway_dashboard_text(),
+                        parse_mode="HTML",
+                        reply_markup=giveaway_admin_keyboard(),
+                    )
+                except BadRequest as error:
+                    if "Message is not modified" not in str(error):
+                        raise
             else:
                 participants = giveaway_data.get("participants", [])
                 if not participants:
